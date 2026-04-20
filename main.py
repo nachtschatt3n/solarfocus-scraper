@@ -156,13 +156,18 @@ EDGES: dict[tuple[str, str], tuple[int, int]] = {
 # Per field: which screen, where to crop, how to OCR, how to parse.
 # `invert=True` flips the image before OCR — helps for white-on-blue (status bars)
 # and white-on-grey (status text in heat-circuit screens).
+# `engine="template"` bypasses tesseract entirely and uses deterministic
+# template matching against the digit glyphs in ./templates/ — needed for
+# fields where tesseract's LSTM path produces different output across CPU
+# instruction sets (AVX2 vs AVX512). Only use for pure-digit fields.
 @dataclass
 class FieldSpec:
     screen: str
     bbox: tuple[int, int, int, int]  # x, y, w, h
-    config: str                      # tesseract --psm + whitelist
+    config: str                      # tesseract --psm + whitelist (unused if engine="template")
     kind: str                        # "float" | "int" | "str"
     invert: bool = False
+    engine: str = "tesseract"        # "tesseract" | "template"
 
 BBOXES: dict[str, FieldSpec] = {
     # main screen
@@ -204,21 +209,13 @@ BBOXES: dict[str, FieldSpec] = {
     "ww_soll_temp":  FieldSpec("warmwasser", (460, 215, 140, 28), FIELD_NUM,  "float"),
     "ww_modus":      FieldSpec("warmwasser", (290, 365, 150, 25), FIELD_TEXT, "str"),
     # Betriebsstundenzähler page 3 — Wärmeverteilung (heat distribution counters).
-    # og_h and fussbodenheizung_h are DISABLED. The container is now on
-    # python:3.12-slim-trixie (tesseract 5.5.0 — matching the 5.5.x on the
-    # dev host), so tesseract version is no longer the root cause. The
-    # remaining divergence is CPU-dependent: tesseract's LSTM inference uses
-    # whatever SIMD is available — AVX512 on my dev laptop vs only AVX2 on
-    # the NUC14 k8s nodes (Intel Core Ultra 5 125H has AVX2, no AVX512).
-    # Same tesseract binary, same captured PNG, but different floating-point
-    # rounding along the LSTM path yields different class probabilities on
-    # these two specific small-glyph rows — the legacy (non-LSTM) engine
-    # (--oem 0) drops digits here too. Real fix is either retraining the
-    # LSTM model with AVX2-only precision, disabling LSTM SIMD at build time,
-    # or accepting these two are permanently unreliable on this hardware.
+    # og_h and fussbodenheizung_h use engine="template": tesseract's LSTM path
+    # produces different output on AVX2 (NUC14 nodes) vs AVX512 (dev host),
+    # consistently misreading these two rows. Template matching bypasses the
+    # LSTM entirely and is CPU-independent.
     "rla_pumpe_h":         FieldSpec("betriebsstunden_p3", (410,  95, 140, 28), FIELD_NUM, "float"),
-    # "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
-    # "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
+    "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float", engine="template"),
+    "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float", engine="template"),
     # Heizkreis Fussbodenheizung (live floor-heating circuit) — rows ~5px higher than OG
     "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (365, 320, 80, 22), FIELD_NUM,  "float"),
     "fbh_vorlaufsolltemperatur": FieldSpec("heizkreise_fbh", (365, 350, 80, 24), FIELD_NUM,  "float"),
@@ -522,6 +519,126 @@ def fill_level_percent(img: Image.Image) -> Optional[float]:
         return None
     filled = sum(1 for p in pixels if p < FILL_BAR_FILLED_THRESHOLD)
     return round(100.0 * filled / len(pixels), 1)
+
+# =============================================================================
+# Template-matching OCR (deterministic, CPU-independent)
+# =============================================================================
+#
+# Tesseract's LSTM engine produces different output on different CPU SIMD paths
+# (AVX2 on the k8s nodes, AVX512 on the dev host), which was consistently
+# misreading og_h and fussbodenheizung_h on the Betriebsstundenzähler p3 screen.
+# Templates sidestep the whole LSTM by comparing binarized digit glyphs pixel-
+# wise against per-digit PNG templates captured once from a known-good render.
+# Same pixels → same glyphs → same output, regardless of CPU.
+
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+TEMPLATE_BINARIZE_THRESHOLD = 128   # grey < this → dark (digit ink)
+TEMPLATE_COL_MIN_DARK = 1           # ≥1 dark pixel → column is part of a glyph
+
+_TEMPLATE_CACHE: Optional[dict[str, Image.Image]] = None
+
+def _load_templates() -> dict[str, Image.Image]:
+    """Lazy-load digit templates from ./templates/<d>.png as binarized L-mode."""
+    global _TEMPLATE_CACHE
+    if _TEMPLATE_CACHE is not None:
+        return _TEMPLATE_CACHE
+    loaded: dict[str, Image.Image] = {}
+    if TEMPLATES_DIR.exists():
+        for p in sorted(TEMPLATES_DIR.glob("*.png")):
+            digit = p.stem
+            if digit in "0123456789":
+                loaded[digit] = _binarize(Image.open(p).convert("L"))
+    _TEMPLATE_CACHE = loaded
+    return loaded
+
+def _binarize(gray: Image.Image) -> Image.Image:
+    """Threshold a grayscale PIL image to pure black/white."""
+    return gray.point(lambda p: 0 if p < TEMPLATE_BINARIZE_THRESHOLD else 255, mode="L")
+
+def _segment_digits(crop_img: Image.Image) -> list[Image.Image]:
+    """Split a horizontal strip into per-digit sub-crops by column-scan whitespace
+    detection. Returns list of binarized glyph crops, each tight-cropped in x and y.
+    Empty list if no dark pixels found."""
+    gray = crop_img.convert("L")
+    binarized = _binarize(gray)
+    w, h = binarized.size
+    px = binarized.load()
+
+    # column-scan: True where column has ≥TEMPLATE_COL_MIN_DARK dark pixels
+    col_has_ink = [
+        sum(1 for y in range(h) if px[x, y] == 0) >= TEMPLATE_COL_MIN_DARK
+        for x in range(w)
+    ]
+    # find runs of ink columns → each run is one glyph
+    runs: list[tuple[int, int]] = []
+    start = None
+    for x, ink in enumerate(col_has_ink):
+        if ink and start is None:
+            start = x
+        elif not ink and start is not None:
+            runs.append((start, x))
+            start = None
+    if start is not None:
+        runs.append((start, w))
+
+    glyphs: list[Image.Image] = []
+    for x0, x1 in runs:
+        # vertical tight-crop within this run
+        col_slice = binarized.crop((x0, 0, x1, h))
+        spx = col_slice.load()
+        cw, ch = col_slice.size
+        top, bot = 0, ch
+        for y in range(ch):
+            if any(spx[x, y] == 0 for x in range(cw)):
+                top = y
+                break
+        for y in range(ch - 1, -1, -1):
+            if any(spx[x, y] == 0 for x in range(cw)):
+                bot = y + 1
+                break
+        if bot > top:
+            glyphs.append(col_slice.crop((0, top, cw, bot)))
+    return glyphs
+
+def _match_glyph(glyph: Image.Image, templates: dict[str, Image.Image]) -> Optional[str]:
+    """Return the digit whose template is closest to `glyph` (by sum of
+    pixelwise absolute difference after resizing glyph to template size).
+    None if no templates loaded."""
+    if not templates:
+        return None
+    from PIL import ImageChops
+    best_digit: Optional[str] = None
+    best_score = float("inf")
+    for digit, tpl in templates.items():
+        resized = glyph.resize(tpl.size, Image.LANCZOS)
+        resized = _binarize(resized)
+        diff = ImageChops.difference(resized, tpl)
+        score = sum(diff.getdata())
+        if score < best_score:
+            best_score = score
+            best_digit = digit
+    return best_digit
+
+def ocr_digits_template(img: Image.Image, region: tuple[int, int, int, int]) -> str:
+    """Deterministic digit OCR via template matching. Returns empty string
+    on failure (no templates loaded, no glyphs found, or all glyphs below
+    confidence threshold)."""
+    templates = _load_templates()
+    if not templates:
+        return ""
+    strip = crop(img, region)
+    glyphs = _segment_digits(strip)
+    if not glyphs:
+        return ""
+    digits: list[str] = []
+    for g in glyphs:
+        d = _match_glyph(g, templates)
+        if d is None:
+            # Partial result is worse than no result — let sanity_check fail
+            # the cycle so we notice rather than publish garbage.
+            return ""
+        digits.append(d)
+    return "".join(digits)
 
 # =============================================================================
 # MQTT
@@ -1094,10 +1211,14 @@ def _ocr_all(img_by_screen: dict[str, Image.Image]) -> dict[str, object]:
         if img is None:
             event(logging.WARNING, "ocr_result", "no image for screen", field=field, screen=spec.screen)
             continue
-        raw = ocr(img, spec.bbox, spec.config, invert=spec.invert)
+        if spec.engine == "template":
+            raw = ocr_digits_template(img, spec.bbox)
+        else:
+            raw = ocr(img, spec.bbox, spec.config, invert=spec.invert)
         parsed = parse_value(raw, spec.kind)
         out[field] = parsed
-        event(logging.DEBUG, "ocr_result", "ocr value", field=field, raw=raw, parsed=parsed)
+        event(logging.DEBUG, "ocr_result", "ocr value",
+              field=field, engine=spec.engine, raw=raw, parsed=parsed)
     if FILL_BAR_REGION is not None:
         main_img = img_by_screen.get("main")
         if main_img is not None:
@@ -1477,6 +1598,46 @@ def cmd_calibrate(args) -> None:
     print("Paste this into SCREENS[\"%s\"].expected_hash:" % name)
     print(f'    expected_hash="{h}",')
 
+def cmd_learn_templates(args) -> None:
+    """Extract per-digit PNG templates from a known-good capture.
+
+    Usage:
+      python main.py learn-templates IMAGE  x,y,w,h  EXPECTED_DIGITS
+
+    Example:
+      python main.py learn-templates screenshots/p3.png 410,135,140,28 36177
+
+    The bbox is segmented by column whitespace; each glyph is saved as
+    templates/<digit>.png matching the corresponding character in
+    EXPECTED_DIGITS. Running multiple times overwrites earlier templates —
+    run against your cleanest capture.
+    """
+    img = Image.open(args.image)
+    region = args.region
+    strip = crop(img, region)
+    glyphs = _segment_digits(strip)
+    expected = args.expected
+    if len(glyphs) != len(expected):
+        sys.exit(f"segmentation mismatch: got {len(glyphs)} glyphs, "
+                 f"expected {len(expected)} for {expected!r}. "
+                 f"Check the bbox or the expected string.")
+    TEMPLATES_DIR.mkdir(exist_ok=True)
+    for g, d in zip(glyphs, expected):
+        if d not in "0123456789":
+            print(f"skipping non-digit {d!r}")
+            continue
+        dest = TEMPLATES_DIR / f"{d}.png"
+        g.save(dest)
+        print(f"wrote {dest} ({g.size[0]}x{g.size[1]})")
+    # Invalidate cache so next OCR picks up fresh templates.
+    global _TEMPLATE_CACHE
+    _TEMPLATE_CACHE = None
+    # Round-trip self-check.
+    tpl = _load_templates()
+    readback = "".join(_match_glyph(g, tpl) or "?" for g in glyphs)
+    status = "ok" if readback == expected else "MISMATCH"
+    print(f"self-check: read back {readback!r} (expected {expected!r}) — {status}")
+
 def cmd_run(args) -> None:
     if not VNC_HOST:
         sys.exit("VNC_HOST not set")
@@ -1546,6 +1707,15 @@ def main() -> None:
     pcal = sub.add_parser("calibrate", help="capture current screen, print hash for paste")
     pcal.add_argument("screen", help="screen name (must already exist in SCREENS)")
     pcal.set_defaults(func=cmd_calibrate)
+
+    plt = sub.add_parser("learn-templates",
+        help="extract per-digit PNG templates from a known-good capture")
+    plt.add_argument("image", help="path to a saved screenshot")
+    plt.add_argument("region", type=_parse_region,
+        help="x,y,w,h of a horizontal digit strip")
+    plt.add_argument("expected",
+        help="the digit string the strip should contain (e.g. 36177)")
+    plt.set_defaults(func=cmd_learn_templates)
 
     pr = sub.add_parser("run", help="production loop")
     pr.add_argument("--no-mqtt", action="store_true", help="dev mode: skip MQTT, just status UI + cycles")

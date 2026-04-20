@@ -24,6 +24,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py ./
+COPY templates/ ./templates/
 
 USER 1000:1000
 
