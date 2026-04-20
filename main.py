@@ -1198,11 +1198,15 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                     if not navigate_to(client, screen_name):
                         raise _NavFail(screen_name)
                     # Extra settle time before capturing for OCR. navigate_to
-                    # returns as soon as the hash region matches, which can
-                    # fire before the rest of the screen (counter value rows,
-                    # status bars) has finished redrawing — causing partial
-                    # OCR reads like og_h=31 when the real value is 36177.
-                    time.sleep(0.75)
+                    # returns as soon as the header hash matches, which can
+                    # fire 1-2 frames before the rest of the screen (counter
+                    # value rows, status bars) has finished drawing in —
+                    # partial captures made og_h read 31 (real 36177) and
+                    # fussbodenheizung_h read 398831 (real 39881) every cycle
+                    # while rla_pumpe_h (top row) read correctly. 2s is the
+                    # shortest delay that consistently gave full redraws in
+                    # testing; total cycle adds ~16s.
+                    time.sleep(2.0)
                     img = vnc_capture(client)
                     img_by_screen[screen_name] = img
                     COORD.update_after_capture(screen_name, img)
