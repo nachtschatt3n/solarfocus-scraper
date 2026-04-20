@@ -929,6 +929,15 @@ class CycleResult:
     values: dict[str, object]
     error_image_b64: Optional[str] = None
 
+
+class _NavFail(Exception):
+    """Raised inside _capture_and_ocr when a screen can't be reached, so the
+    outer caller can route to _handle_nav_fail without returning from deep
+    nested control flow."""
+    def __init__(self, screen: str):
+        self.screen = screen
+        super().__init__(f"could not reach {screen}")
+
 def _identify_screen(img: Image.Image) -> Optional[str]:
     """Return the name of the matching known screen, or None."""
     for name, screen in SCREENS.items():
@@ -1143,34 +1152,61 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                 # the last alert's text persists as reference.
                 broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "off", retain=True)
 
-            img_by_screen: dict[str, Image.Image] = {}
-            # Visit each screen referenced by BBOXES (plus `main` for the fill bar).
             screens_needed = sorted({spec.screen for spec in BBOXES.values()} | {"main"})
-            for screen_name in screens_needed:
-                COORD.set_phase("navigating", detail=f"→ {screen_name}")
-                COORD.set_target(screen_name)
-                if not navigate_to(client, screen_name):
-                    final_status = "navigation_failed"
-                    final_error = f"could not reach {screen_name}"
-                    return _handle_nav_fail(client, broker, dry_run, screen_name)
-                img = vnc_capture(client)
-                img_by_screen[screen_name] = img
-                COORD.update_after_capture(screen_name, img)
 
-            COORD.set_phase("ocr")
-            COORD.set_target(None)
-            values = _ocr_all(img_by_screen)
-            for field, val in values.items():
-                COORD.record_value(field, val)
+            def _capture_and_ocr() -> dict[str, object]:
+                """Navigate each needed screen, capture, OCR everything, record in COORD."""
+                img_by_screen: dict[str, Image.Image] = {}
+                for screen_name in screens_needed:
+                    COORD.set_phase("navigating", detail=f"→ {screen_name}")
+                    COORD.set_target(screen_name)
+                    if not navigate_to(client, screen_name):
+                        raise _NavFail(screen_name)
+                    img = vnc_capture(client)
+                    img_by_screen[screen_name] = img
+                    COORD.update_after_capture(screen_name, img)
+                COORD.set_phase("ocr")
+                COORD.set_target(None)
+                v = _ocr_all(img_by_screen)
+                for field, val in v.items():
+                    COORD.record_value(field, val)
+                return v
+
+            try:
+                values = _capture_and_ocr()
+            except _NavFail as nf:
+                final_status = "navigation_failed"
+                final_error = f"could not reach {nf.screen}"
+                return _handle_nav_fail(client, broker, dry_run, nf.screen)
+
+            # First sanity pass. If it trips, re-capture + re-OCR everything
+            # once — the heater's UI occasionally redraws mid-frame and a
+            # slightly different capture resolves the OCR misread. This keeps
+            # the scraper unstuck after transient OCR spills (e.g. '35' read
+            # as '357' when the bbox overlaps a row boundary) without the
+            # complexity of partial publishes.
+            err = _sanity_check(values, broker)
+            if err:
+                event(logging.WARNING, "sanity_retry",
+                      "sanity failed on first pass, re-capturing + re-OCR'ing",
+                      reason=err)
+                try:
+                    values_retry = _capture_and_ocr()
+                except _NavFail as nf:
+                    final_status = "navigation_failed"
+                    final_error = f"could not reach {nf.screen} (on retry)"
+                    return _handle_nav_fail(client, broker, dry_run, nf.screen)
+                values = values_retry
+                err = _sanity_check(values, broker)
         finally:
             try:
                 client.disconnect()
             except Exception:
                 pass
 
-        err = _sanity_check(values, broker)
         if err:
-            event(logging.ERROR, "sanity_check_failed", "sanity failed", reason=err)
+            event(logging.ERROR, "sanity_check_failed",
+                  "sanity failed after retry", reason=err)
             m_runs.labels(status="sanity_failed").inc()
             if broker and not dry_run:
                 broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "sanity_failed", retain=True)
