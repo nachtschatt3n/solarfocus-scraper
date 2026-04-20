@@ -204,11 +204,21 @@ BBOXES: dict[str, FieldSpec] = {
     "ww_soll_temp":  FieldSpec("warmwasser", (460, 215, 140, 28), FIELD_NUM,  "float"),
     "ww_modus":      FieldSpec("warmwasser", (290, 365, 150, 25), FIELD_TEXT, "str"),
     # Betriebsstundenzähler page 3 — Wärmeverteilung (heat distribution counters).
-    # Container now on python:3.12-slim-trixie → tesseract 5.5.0, matching the
-    # dev host; earlier Debian 12 (bookworm) 5.3.x misread the middle rows.
+    # og_h and fussbodenheizung_h are DISABLED. The container is now on
+    # python:3.12-slim-trixie (tesseract 5.5.0 — matching the 5.5.x on the
+    # dev host), so tesseract version is no longer the root cause. The
+    # remaining divergence is CPU-dependent: tesseract's LSTM inference uses
+    # whatever SIMD is available — AVX512 on my dev laptop vs only AVX2 on
+    # the NUC14 k8s nodes (Intel Core Ultra 5 125H has AVX2, no AVX512).
+    # Same tesseract binary, same captured PNG, but different floating-point
+    # rounding along the LSTM path yields different class probabilities on
+    # these two specific small-glyph rows — the legacy (non-LSTM) engine
+    # (--oem 0) drops digits here too. Real fix is either retraining the
+    # LSTM model with AVX2-only precision, disabling LSTM SIMD at build time,
+    # or accepting these two are permanently unreliable on this hardware.
     "rla_pumpe_h":         FieldSpec("betriebsstunden_p3", (410,  95, 140, 28), FIELD_NUM, "float"),
-    "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
-    "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
+    # "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
+    # "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
     # Heizkreis Fussbodenheizung (live floor-heating circuit) — rows ~5px higher than OG
     "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (365, 320, 80, 22), FIELD_NUM,  "float"),
     "fbh_vorlaufsolltemperatur": FieldSpec("heizkreise_fbh", (365, 350, 80, 24), FIELD_NUM,  "float"),
