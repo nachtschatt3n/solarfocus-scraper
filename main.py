@@ -256,6 +256,30 @@ COUNTER_FIELDS: set[str] = {
     "rla_pumpe_h", "og_h", "fussbodenheizung_h",
 }
 
+# Maximum absolute change allowed between consecutive cycles per field. Catches
+# OCR digit-swaps / prefix-smears that would pass a static range check (e.g.
+# kesseltemperatur jumping 62 → 869 — "in range" under a 0-1000 bound, but
+# physically impossible at a 5-minute interval). Fields not listed here are
+# not delta-checked. Tuned for the default SCRAPE_INTERVAL_SECONDS=300.
+MAX_DELTA_PER_CYCLE: dict[str, float] = {
+    "kesseltemperatur":            15.0,   # °C — burner ramp is slow
+    "outside_temperature":          8.0,   # °C
+    "puffer_temp_top":             10.0,   # °C
+    "puffer_temp_bottom":          10.0,   # °C
+    "restsauerstoffgehalt":         5.0,   # %
+    "fill_level_percent":           5.0,   # % — pellet auger delivers in steps
+    "og_vorlauftemperatur":         8.0,   # °C
+    "og_vorlaufsolltemperatur":    20.0,   # °C — setpoint can jump on schedule
+    "og_mischerposition":          30.0,   # %  — mixer can slam open/shut
+    "fbh_vorlauftemperatur":        8.0,
+    "fbh_vorlaufsolltemperatur":   20.0,
+    "fbh_mischerposition":         30.0,
+    "ww_ist_temp":                  8.0,
+    "ww_soll_temp":                50.0,   # DHW setpoint flips between day/night
+    # Counter fields not listed — their monotonic increase is already enforced
+    # by the COUNTER_FIELDS logic.
+}
+
 # Home Assistant discovery metadata per field.
 @dataclass
 class SensorMeta:
@@ -1034,7 +1058,15 @@ def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
 
 
 def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker]) -> Optional[str]:
-    """Return error string on failure, else None."""
+    """Return error string on failure, else None.
+
+    Three layers, cheapest first:
+      1. Static bounds (SANITY_BOUNDS) — physical range per field.
+      2. Counter monotonicity (COUNTER_FIELDS) — hour meters never decrease.
+      3. Delta check (MAX_DELTA_PER_CYCLE) — plausible change between cycles.
+         Skipped when no prior value is known (first cycle, or retained state
+         was cleared) — the static bounds are the only defense then.
+    """
     for field, val in values.items():
         if val is None:
             continue
@@ -1050,6 +1082,18 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker]) -> Op
                     prev = float(prev_str)
                     if val < prev:
                         return f"{field}={val} decreased from {prev}"
+                except ValueError:
+                    pass
+        max_delta = MAX_DELTA_PER_CYCLE.get(field)
+        if max_delta is not None and broker and isinstance(val, (int, float)):
+            prev_str = broker.get_last(field)
+            if prev_str:
+                try:
+                    prev = float(prev_str)
+                    if abs(val - prev) > max_delta:
+                        return (f"{field}={val} delta={val - prev:+.1f} "
+                                f"exceeds ±{max_delta} from prev={prev} "
+                                "(likely OCR misread)")
                 except ValueError:
                     pass
     return None
@@ -1141,7 +1185,11 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
             for field, val in values.items():
                 if val is None:
                     continue
-                broker.publish(f"{MQTT_TOPIC_PREFIX}/{field}", str(val))
+                # Retain sensor values so HA recovers state on restart and the
+                # delta check in _sanity_check has a stable baseline after a
+                # pod restart. Non-retained publishes were dropping HA entities
+                # to "unknown" after every HA reload.
+                broker.publish(f"{MQTT_TOPIC_PREFIX}/{field}", str(val), retain=True)
                 event(logging.DEBUG, "mqtt_published", "value published", field=field, value=val)
             broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "ok", retain=True)
             broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/last_run",
