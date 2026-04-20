@@ -189,7 +189,12 @@ BBOXES: dict[str, FieldSpec] = {
     "puffer_temp_bottom":  FieldSpec("kessel", (320, 320,  75, 30), FIELD_NUM,  "float"),
     "kessel_status_text":  FieldSpec("kessel", (100, 398, 440, 30), FIELD_TEXT, "str", invert=True),
     # Heizkreis OG screen
-    "og_vorlauftemperatur":     FieldSpec("heizkreise_og", (365, 325,  80, 22), FIELD_NUM,  "float"),
+    # Y range covers both heat-circuit layouts: 4-row "Heizbetrieb" (value at
+    # y≈325) and 3-row "Absenkbetrieb" where the Vorlaufsolltemperatur row is
+    # hidden and Vorlauftemperatur shifts up to y≈320. Widened bbox captures
+    # either without changing the OCR output — the digit glyphs sit centered
+    # in the crop in both cases.
+    "og_vorlauftemperatur":     FieldSpec("heizkreise_og", (365, 316,  80, 26), FIELD_NUM,  "float"),
     "og_vorlaufsolltemperatur": FieldSpec("heizkreise_og", (365, 355,  80, 22), FIELD_NUM,  "float"),
     "og_mischerposition":       FieldSpec("heizkreise_og", (380, 380,  70, 22), FIELD_NUM,  "float"),
     "og_status_text":           FieldSpec("heizkreise_og", (130, 410, 360, 28), FIELD_TEXT, "str", invert=True),
