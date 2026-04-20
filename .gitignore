@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+# Root-level scratch dir used by `python main.py probe/click/explore`.
+# The leading slash pins this pattern to the repo root so docs/screenshots/
+# (the committed README assets) is NOT ignored.
+/screenshots/

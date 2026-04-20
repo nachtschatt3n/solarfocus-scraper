@@ -1,0 +1,7 @@
+vncdotool==1.2.0
+paho-mqtt==2.1.0
+Pillow==11.0.0
+pytesseract==0.3.13
+prometheus_client==0.21.1
+python-json-logger==3.2.1
+python-dotenv==1.0.1

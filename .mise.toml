@@ -1,0 +1,6 @@
+[env]
+_.python.venv = { path = "{{config_root}}/.venv", create = true }
+
+[tasks.deps]
+description = "Install scraper Python deps via uv"
+run = "uv pip install -r requirements.txt"
