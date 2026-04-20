@@ -204,7 +204,7 @@ BBOXES: dict[str, FieldSpec] = {
     "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
     # Heizkreis Fussbodenheizung (live floor-heating circuit) — rows ~5px higher than OG
     "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (365, 320, 80, 22), FIELD_NUM,  "float"),
-    "fbh_vorlaufsolltemperatur": FieldSpec("heizkreise_fbh", (365, 348, 80, 22), FIELD_NUM,  "float"),
+    "fbh_vorlaufsolltemperatur": FieldSpec("heizkreise_fbh", (365, 350, 80, 24), FIELD_NUM,  "float"),
     "fbh_mischerposition":       FieldSpec("heizkreise_fbh", (365, 378, 80, 22), FIELD_NUM,  "float"),
     "fbh_status_text":           FieldSpec("heizkreise_fbh", (130, 410, 360, 28), FIELD_TEXT, "str", invert=True),
     "fbh_heizkreis_status":      FieldSpec("heizkreise_fbh", ( 80, 445, 520, 22), FIELD_TEXT, "str", invert=True),
