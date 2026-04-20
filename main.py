@@ -204,16 +204,9 @@ BBOXES: dict[str, FieldSpec] = {
     "ww_soll_temp":  FieldSpec("warmwasser", (460, 215, 140, 28), FIELD_NUM,  "float"),
     "ww_modus":      FieldSpec("warmwasser", (290, 365, 150, 25), FIELD_TEXT, "str"),
     # Betriebsstundenzähler page 3 — Wärmeverteilung (heat distribution counters)
-    # NOTE: og_h and fussbodenheizung_h are currently disabled. Cluster captures
-    # consistently misread these two rows (og row reads "31" for real 36177,
-    # fbh row reads "398831" for real 39881) even with a 2s post-navigate
-    # settle. RLA-Pumpe (top row) always reads correctly. Local probes of the
-    # same screen OCR cleanly, so the misread is specific to the timing of the
-    # pod's rapid sequential navigation. Re-enable once the underlying capture
-    # timing / bbox drift is resolved; see issue tracking.
     "rla_pumpe_h":         FieldSpec("betriebsstunden_p3", (410,  95, 140, 28), FIELD_NUM, "float"),
-    # "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
-    # "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
+    "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
+    "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
     # Heizkreis Fussbodenheizung (live floor-heating circuit) — rows ~5px higher than OG
     "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (365, 320, 80, 22), FIELD_NUM,  "float"),
     "fbh_vorlaufsolltemperatur": FieldSpec("heizkreise_fbh", (365, 350, 80, 24), FIELD_NUM,  "float"),
@@ -706,6 +699,10 @@ class Coordinator:
         self.last_screenshot_png: Optional[bytes] = None
         self.last_screenshot_ts: float = 0.0
         self.last_screenshot_screen: Optional[str] = None
+        # Per-screen captures for debugging capture-timing / OCR-misread issues.
+        # Indexed by screen name. Populated on every successful capture so that
+        # `/screenshot/<screen>.png` can serve the latest image of that screen.
+        self.per_screen_captures: dict[str, tuple[bytes, float]] = {}
         # Field values + recording timestamps
         self.values: dict[str, ValueRecord] = {}
 
@@ -743,11 +740,18 @@ class Coordinator:
         buf = BytesIO()
         img.save(buf, format="PNG")
         png = buf.getvalue()
+        now = time.time()
         with self.state_lock:
             self.current_screen = screen
             self.last_screenshot_png = png
-            self.last_screenshot_ts = time.time()
+            self.last_screenshot_ts = now
             self.last_screenshot_screen = screen
+            if screen:
+                self.per_screen_captures[screen] = (png, now)
+
+    def get_screen_png(self, screen: str) -> Optional[tuple[bytes, float]]:
+        with self.state_lock:
+            return self.per_screen_captures.get(screen)
 
     def record_value(self, field: str, value: object) -> None:
         with self.state_lock:
@@ -952,6 +956,19 @@ class _HealthHandler(BaseHTTPRequestHandler):
             if png is None:
                 self._send(404, "text/plain", b"no screenshot yet\n")
             else:
+                self._send(200, "image/png", png)
+        elif path.startswith("/screenshot/") and path.endswith(".png"):
+            # /screenshot/<screen>.png — latest capture of a named screen. Useful
+            # for diagnosing per-screen OCR issues without waiting for that
+            # screen to be the "last captured" one (the default /screenshot.png
+            # only shows whichever screen was visited last in the cycle).
+            screen = path[len("/screenshot/"):-len(".png")]
+            entry = COORD.get_screen_png(screen)
+            if entry is None:
+                self._send(404, "text/plain",
+                           f"no capture yet for screen={screen}\n".encode())
+            else:
+                png, _ts = entry
                 self._send(200, "image/png", png)
         else:
             self._send(404, "text/plain", b"not found\n")
