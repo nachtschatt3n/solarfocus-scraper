@@ -313,6 +313,15 @@ MAX_DELTA_PER_CYCLE: dict[str, float] = {
     "pelletsverbrauch_kg":         20.0,   # peak burn ~2 kg/min
 }
 
+# Deadlock-breaker for legitimate large changes. If a field reads the same (≈)
+# out-of-delta value across N consecutive cycles, accept it — OCR misreads
+# don't repeat pixel-identically, so persistent agreement implies the physical
+# value genuinely moved. At SCRAPE_INTERVAL_SECONDS=300, N=3 = ~15 min of
+# confirmation before overriding. Tracker is in-memory (resets on pod restart,
+# which is fine: the retained MQTT value is then refreshed on first cycle).
+_DELTA_CONFIRM: dict[str, tuple[float, int]] = {}
+DELTA_CONFIRM_THRESHOLD = 3
+
 # Home Assistant discovery metadata per field.
 @dataclass
 class SensorMeta:
@@ -1258,7 +1267,8 @@ def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
     return seen
 
 
-def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker]) -> Optional[str]:
+def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
+                  allow_delta_override: bool = False) -> Optional[str]:
     """Return error string on failure, else None.
 
     Three layers, cheapest first:
@@ -1267,6 +1277,12 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker]) -> Op
       3. Delta check (MAX_DELTA_PER_CYCLE) — plausible change between cycles.
          Skipped when no prior value is known (first cycle, or retained state
          was cleared) — the static bounds are the only defense then.
+
+    `allow_delta_override=True` enables the deadlock-breaker: persistent
+    out-of-delta reads get counted in _DELTA_CONFIRM, and once a field's same
+    out-of-delta value has been seen DELTA_CONFIRM_THRESHOLD cycles in a row,
+    the reject is flipped to accept. Only set True on the retry pass of
+    run_cycle so we count once per cycle, not once per sanity call.
     """
     for field, val in values.items():
         if val is None:
@@ -1291,10 +1307,32 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker]) -> Op
             if prev_str:
                 try:
                     prev = float(prev_str)
-                    if abs(val - prev) > max_delta:
+                    over = abs(val - prev) > max_delta
+                    if over and allow_delta_override:
+                        tol = max(1.0, max_delta * 0.1)
+                        tracked = _DELTA_CONFIRM.get(field)
+                        if tracked and abs(val - tracked[0]) <= tol:
+                            count = tracked[1] + 1
+                        else:
+                            count = 1
+                        if count >= DELTA_CONFIRM_THRESHOLD:
+                            event(logging.WARNING, "delta_override_accepted",
+                                  "accepting out-of-delta value after persistent confirmation",
+                                  field=field, value=val, prev=prev,
+                                  delta=val - prev, max_delta=max_delta,
+                                  confirmations=count)
+                            _DELTA_CONFIRM.pop(field, None)
+                            continue
+                        _DELTA_CONFIRM[field] = (val, count)
+                        return (f"{field}={val} delta={val - prev:+.1f} "
+                                f"exceeds ±{max_delta} from prev={prev} "
+                                f"(likely OCR misread; confirm {count}/{DELTA_CONFIRM_THRESHOLD})")
+                    if over:
                         return (f"{field}={val} delta={val - prev:+.1f} "
                                 f"exceeds ±{max_delta} from prev={prev} "
                                 "(likely OCR misread)")
+                    if allow_delta_override:
+                        _DELTA_CONFIRM.pop(field, None)
                 except ValueError:
                     pass
     return None
@@ -1399,7 +1437,7 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                     final_error = f"could not reach {nf.screen} (on retry)"
                     return _handle_nav_fail(client, broker, dry_run, nf.screen)
                 values = values_retry
-                err = _sanity_check(values, broker)
+                err = _sanity_check(values, broker, allow_delta_override=True)
         finally:
             try:
                 client.disconnect()
