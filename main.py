@@ -462,7 +462,18 @@ def parse_value(raw: str, kind: str) -> Optional[float | int | str]:
     if not cleaned:
         return None
     try:
-        return int(cleaned) if kind == "int" else float(cleaned)
+        if kind == "int":
+            return int(cleaned)
+        val = float(cleaned)
+        # Dropped-decimal heuristic: Tesseract occasionally eats the '.' on
+        # small fonts ("35.7" → "357", "46.9" → "469"). If we got exactly
+        # 3 digits, no dot, and the result is > 200, reinterpret as "NN.N".
+        # 200 was chosen as a safe threshold: real percentages top out at 100,
+        # temperatures top out near 150 °C even under peak burner load, and
+        # no field this scraper reads legitimately exceeds 200 as a small int.
+        if "." not in cleaned and cleaned.isdigit() and len(cleaned) == 3 and val > 200:
+            return float(f"{cleaned[:-1]}.{cleaned[-1]}")
+        return val
     except ValueError:
         return None
 
