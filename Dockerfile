@@ -1,4 +1,10 @@
-FROM python:3.12-slim AS base
+# Pinned to Debian 13 (trixie) for tesseract 5.5.0 — the default `python:3.12-slim`
+# tag still points at Debian 12 (bookworm) which ships tesseract 5.3.0, and that
+# older build produces different LSTM output on small anti-aliased digit glyphs
+# than 5.5.x (my dev host on Arch), causing values that OCR fine on local to
+# come back wrong from the pod. Pinning the slim-trixie variant keeps OCR
+# results consistent between dev and production.
+FROM python:3.12-slim-trixie AS base
 
 # Tesseract + German lang pack for OCR. apt cache is cleaned in the same RUN
 # layer so it doesn't bloat the image.

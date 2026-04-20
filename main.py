@@ -203,17 +203,12 @@ BBOXES: dict[str, FieldSpec] = {
     "ww_ist_temp":   FieldSpec("warmwasser", (165, 178,  90, 28), FIELD_NUM,  "float"),
     "ww_soll_temp":  FieldSpec("warmwasser", (460, 215, 140, 28), FIELD_NUM,  "float"),
     "ww_modus":      FieldSpec("warmwasser", (290, 365, 150, 25), FIELD_TEXT, "str"),
-    # Betriebsstundenzähler page 3 — Wärmeverteilung.
-    # og_h + fussbodenheizung_h are DISABLED: the container's Debian tesseract
-    # 5.3.x consistently misreads them (og=31 real 36177, fbh=398831 real
-    # 39882) while producing correct reads on every other field on the page
-    # (rla_pumpe_h row). My local Arch tesseract 5.5.x reads the same captured
-    # PNG correctly, so it's a tesseract cross-version quirk on these two
-    # specific glyph combinations. See TODO: either pin tesseract in the
-    # Dockerfile or bundle tessdata_best to resolve.
+    # Betriebsstundenzähler page 3 — Wärmeverteilung (heat distribution counters).
+    # Container now on python:3.12-slim-trixie → tesseract 5.5.0, matching the
+    # dev host; earlier Debian 12 (bookworm) 5.3.x misread the middle rows.
     "rla_pumpe_h":         FieldSpec("betriebsstunden_p3", (410,  95, 140, 28), FIELD_NUM, "float"),
-    # "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
-    # "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
+    "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
+    "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
     # Heizkreis Fussbodenheizung (live floor-heating circuit) — rows ~5px higher than OG
     "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (365, 320, 80, 22), FIELD_NUM,  "float"),
     "fbh_vorlaufsolltemperatur": FieldSpec("heizkreise_fbh", (365, 350, 80, 24), FIELD_NUM,  "float"),
