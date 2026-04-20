@@ -476,11 +476,12 @@ def ocr(img: Image.Image, region: tuple[int, int, int, int], config: str,
         # Grayscale-then-invert handles white-on-blue (status bars) much better
         # than RGB invert, which produces low-contrast yellow-on-yellow.
         c = ImageOps.invert(c.convert("L"))
-    # 3x LANCZOS upscale gives tesseract larger glyphs to work with, which
-    # stabilises reads across tesseract versions (the container's Debian
-    # 5.3.x package and a local Arch 5.5.x can produce different results on
-    # 2x-upscaled small digits — 3x closes most of that gap).
-    big = c.resize((c.width * 3, c.height * 3), Image.LANCZOS)
+    # Normalise to grayscale then upscale 2x with LANCZOS. Grayscale first
+    # strips per-channel anti-aliasing noise that different tesseract builds
+    # (Debian 5.3.x in the container vs Arch 5.5.x locally) treat
+    # inconsistently on 2-digit glyphs.
+    c = c.convert("L")
+    big = c.resize((c.width * 2, c.height * 2), Image.LANCZOS)
     return pytesseract.image_to_string(big, lang=lang, config=config).strip()
 
 def parse_value(raw: str, kind: str) -> Optional[float | int | str]:
