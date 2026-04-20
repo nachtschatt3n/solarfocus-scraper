@@ -262,10 +262,10 @@ COUNTER_FIELDS: set[str] = {
 # physically impossible at a 5-minute interval). Fields not listed here are
 # not delta-checked. Tuned for the default SCRAPE_INTERVAL_SECONDS=300.
 MAX_DELTA_PER_CYCLE: dict[str, float] = {
-    "kesseltemperatur":            15.0,   # °C — burner ramp is slow
+    "kesseltemperatur":            25.0,   # °C — can ramp fast when burner ignites
     "outside_temperature":          8.0,   # °C
-    "puffer_temp_top":             10.0,   # °C
-    "puffer_temp_bottom":          10.0,   # °C
+    "puffer_temp_top":             25.0,   # °C — top of buffer heats fast under active charging
+    "puffer_temp_bottom":          20.0,   # °C
     "restsauerstoffgehalt":         5.0,   # %
     "fill_level_percent":           5.0,   # % — pellet auger delivers in steps
     "og_vorlauftemperatur":         8.0,   # °C
