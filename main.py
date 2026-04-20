@@ -1268,15 +1268,14 @@ def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
 
 
 def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
-                  allow_delta_override: bool = False) -> Optional[str]:
-    """Return error string on failure, else None.
+                  allow_delta_override: bool = False) -> dict[str, str]:
+    """Return a dict of {field: reject_reason} — empty if all values passed.
 
-    Three layers, cheapest first:
-      1. Static bounds (SANITY_BOUNDS) — physical range per field.
+    Three layers per field:
+      1. Static bounds (SANITY_BOUNDS) — physical range.
       2. Counter monotonicity (COUNTER_FIELDS) — hour meters never decrease.
       3. Delta check (MAX_DELTA_PER_CYCLE) — plausible change between cycles.
-         Skipped when no prior value is known (first cycle, or retained state
-         was cleared) — the static bounds are the only defense then.
+         Skipped when no prior value is known.
 
     `allow_delta_override=True` enables the deadlock-breaker: persistent
     out-of-delta reads get counted in _DELTA_CONFIRM, and once a field's same
@@ -1284,12 +1283,10 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
     the reject is flipped to accept. Only set True on the retry pass of
     run_cycle so we count once per cycle, not once per sanity call.
 
-    Bounds + counter-decrease fail fast (unambiguous faults). Delta failures
-    track *every* offending field in one pass before returning, so N
-    simultaneously-stuck fields all recover in the same 3 cycles rather than
-    serializing at 3×N cycles.
+    Every field is checked in one pass; run_cycle publishes the accepted
+    fields and holds back only the rejected ones.
     """
-    pending_delta_err: Optional[str] = None
+    rejected: dict[str, str] = {}
     for field, val in values.items():
         if val is None:
             continue
@@ -1297,14 +1294,16 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
         if bounds and isinstance(val, (int, float)):
             lo, hi = bounds
             if not (lo <= val <= hi):
-                return f"{field}={val} out of bounds [{lo}, {hi}]"
+                rejected[field] = f"{val} out of bounds [{lo}, {hi}]"
+                continue
         if field in COUNTER_FIELDS and broker and isinstance(val, (int, float)):
             prev_str = broker.get_last(field)
             if prev_str:
                 try:
                     prev = float(prev_str)
                     if val < prev:
-                        return f"{field}={val} decreased from {prev}"
+                        rejected[field] = f"{val} decreased from {prev}"
+                        continue
                 except ValueError:
                     pass
         max_delta = MAX_DELTA_PER_CYCLE.get(field)
@@ -1330,24 +1329,18 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
                             _DELTA_CONFIRM.pop(field, None)
                             continue
                         _DELTA_CONFIRM[field] = (val, count)
-                        if pending_delta_err is None:
-                            pending_delta_err = (
-                                f"{field}={val} delta={val - prev:+.1f} "
-                                f"exceeds ±{max_delta} from prev={prev} "
-                                f"(likely OCR misread; confirm {count}/{DELTA_CONFIRM_THRESHOLD})")
-                        continue
-                    if over:
-                        if pending_delta_err is None:
-                            pending_delta_err = (
-                                f"{field}={val} delta={val - prev:+.1f} "
-                                f"exceeds ±{max_delta} from prev={prev} "
-                                "(likely OCR misread)")
-                        continue
-                    if allow_delta_override:
+                        rejected[field] = (
+                            f"{val} delta={val - prev:+.1f} exceeds ±{max_delta} "
+                            f"from prev={prev} (confirm {count}/{DELTA_CONFIRM_THRESHOLD})")
+                    elif over:
+                        rejected[field] = (
+                            f"{val} delta={val - prev:+.1f} exceeds ±{max_delta} "
+                            f"from prev={prev}")
+                    elif allow_delta_override:
                         _DELTA_CONFIRM.pop(field, None)
                 except ValueError:
                     pass
-    return pending_delta_err
+    return rejected
 
 def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref: Optional[list[bool]] = None) -> CycleResult:
     """One full cycle, gated by COORD.try_begin_cycle().
@@ -1431,17 +1424,17 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                 final_error = f"could not reach {nf.screen}"
                 return _handle_nav_fail(client, broker, dry_run, nf.screen)
 
-            # First sanity pass. If it trips, re-capture + re-OCR everything
-            # once — the heater's UI occasionally redraws mid-frame and a
-            # slightly different capture resolves the OCR misread. This keeps
-            # the scraper unstuck after transient OCR spills (e.g. '35' read
-            # as '357' when the bbox overlaps a row boundary) without the
-            # complexity of partial publishes.
-            err = _sanity_check(values, broker)
-            if err:
+            # First sanity pass. If any field trips, re-capture + re-OCR
+            # everything once — the heater's UI occasionally redraws mid-frame
+            # and a slightly different capture resolves transient OCR misreads
+            # (e.g. '35' read as '357' when the bbox overlaps a row boundary).
+            # On the retry pass we enable the delta-override so persistent
+            # out-of-delta reads can advance their confirm counter.
+            rejected = _sanity_check(values, broker)
+            if rejected:
                 event(logging.WARNING, "sanity_retry",
                       "sanity failed on first pass, re-capturing + re-OCR'ing",
-                      reason=err)
+                      rejected=rejected)
                 try:
                     values_retry = _capture_and_ocr()
                 except _NavFail as nf:
@@ -1449,48 +1442,59 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                     final_error = f"could not reach {nf.screen} (on retry)"
                     return _handle_nav_fail(client, broker, dry_run, nf.screen)
                 values = values_retry
-                err = _sanity_check(values, broker, allow_delta_override=True)
+                rejected = _sanity_check(values, broker, allow_delta_override=True)
         finally:
             try:
                 client.disconnect()
             except Exception:
                 pass
 
-        if err:
+        # Partial publish: skip rejected fields, publish the rest. One stuck
+        # OCR field must not freeze the other 33. `sanity_failed` is reserved
+        # for the edge case where every readable field was rejected — that
+        # implies the scrape is globally broken (wrong screen, alert modal).
+        accepted = {f: v for f, v in values.items() if v is not None and f not in rejected}
+        if rejected and not accepted:
             event(logging.ERROR, "sanity_check_failed",
-                  "sanity failed after retry", reason=err)
+                  "all fields rejected", rejected=rejected)
             m_runs.labels(status="sanity_failed").inc()
             if broker and not dry_run:
                 broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "sanity_failed", retain=True)
-            final_status, final_error = "sanity_failed", err
+            final_status, final_error = "sanity_failed", "all fields rejected"
             return CycleResult(status="sanity_failed", values=values)
+
+        if rejected:
+            event(logging.WARNING, "sanity_partial",
+                  "cycle publishing with some fields held back",
+                  rejected=rejected, accepted_count=len(accepted))
 
         if broker and not dry_run:
             COORD.set_phase("publishing")
             if first_run_ref and first_run_ref[0]:
                 publish_discovery(broker)
                 first_run_ref[0] = False
-            for field, val in values.items():
-                if val is None:
-                    continue
+            for field, val in accepted.items():
                 # Retain sensor values so HA recovers state on restart and the
                 # delta check in _sanity_check has a stable baseline after a
                 # pod restart. Non-retained publishes were dropping HA entities
                 # to "unknown" after every HA reload.
                 broker.publish(f"{MQTT_TOPIC_PREFIX}/{field}", str(val), retain=True)
                 event(logging.DEBUG, "mqtt_published", "value published", field=field, value=val)
-            broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "ok", retain=True)
+            status = "partial" if rejected else "ok"
+            broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", status, retain=True)
             broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/last_run",
                            datetime.now(timezone.utc).isoformat(), retain=True)
 
         duration = time.time() - COORD.cycle_started_ts
         m_last_run.set(time.time())
         m_last_dur.set(duration)
-        m_runs.labels(status="ok").inc()
-        final_status = "ok"
-        event(logging.INFO, "cycle_complete", "cycle ok", duration_s=round(duration, 2),
-              field_count=len([v for v in values.values() if v is not None]))
-        return CycleResult(status="ok", values=values)
+        result_status = "partial" if rejected else "ok"
+        m_runs.labels(status=result_status).inc()
+        final_status = result_status
+        event(logging.INFO, "cycle_complete",
+              f"cycle {result_status}", duration_s=round(duration, 2),
+              accepted_count=len(accepted), rejected_count=len(rejected))
+        return CycleResult(status=result_status, values=values)
     except Exception as e:
         final_status, final_error = "error", str(e)
         event(logging.ERROR, "cycle_error", "unhandled cycle exception", error=str(e))
