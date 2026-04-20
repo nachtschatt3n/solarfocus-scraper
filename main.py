@@ -1192,6 +1192,12 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                     COORD.set_target(screen_name)
                     if not navigate_to(client, screen_name):
                         raise _NavFail(screen_name)
+                    # Extra settle time before capturing for OCR. navigate_to
+                    # returns as soon as the hash region matches, which can
+                    # fire before the rest of the screen (counter value rows,
+                    # status bars) has finished redrawing — causing partial
+                    # OCR reads like og_h=31 when the real value is 36177.
+                    time.sleep(0.75)
                     img = vnc_capture(client)
                     img_by_screen[screen_name] = img
                     COORD.update_after_capture(screen_name, img)
