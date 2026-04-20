@@ -204,9 +204,16 @@ BBOXES: dict[str, FieldSpec] = {
     "ww_soll_temp":  FieldSpec("warmwasser", (460, 215, 140, 28), FIELD_NUM,  "float"),
     "ww_modus":      FieldSpec("warmwasser", (290, 365, 150, 25), FIELD_TEXT, "str"),
     # Betriebsstundenzähler page 3 — Wärmeverteilung (heat distribution counters)
+    # NOTE: og_h and fussbodenheizung_h are currently disabled. Cluster captures
+    # consistently misread these two rows (og row reads "31" for real 36177,
+    # fbh row reads "398831" for real 39881) even with a 2s post-navigate
+    # settle. RLA-Pumpe (top row) always reads correctly. Local probes of the
+    # same screen OCR cleanly, so the misread is specific to the timing of the
+    # pod's rapid sequential navigation. Re-enable once the underlying capture
+    # timing / bbox drift is resolved; see issue tracking.
     "rla_pumpe_h":         FieldSpec("betriebsstunden_p3", (410,  95, 140, 28), FIELD_NUM, "float"),
-    "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
-    "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
+    # "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
+    # "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
     # Heizkreis Fussbodenheizung (live floor-heating circuit) — rows ~5px higher than OG
     "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (365, 320, 80, 22), FIELD_NUM,  "float"),
     "fbh_vorlaufsolltemperatur": FieldSpec("heizkreise_fbh", (365, 350, 80, 24), FIELD_NUM,  "float"),
