@@ -1283,7 +1283,13 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
     out-of-delta value has been seen DELTA_CONFIRM_THRESHOLD cycles in a row,
     the reject is flipped to accept. Only set True on the retry pass of
     run_cycle so we count once per cycle, not once per sanity call.
+
+    Bounds + counter-decrease fail fast (unambiguous faults). Delta failures
+    track *every* offending field in one pass before returning, so N
+    simultaneously-stuck fields all recover in the same 3 cycles rather than
+    serializing at 3×N cycles.
     """
+    pending_delta_err: Optional[str] = None
     for field, val in values.items():
         if val is None:
             continue
@@ -1324,18 +1330,24 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
                             _DELTA_CONFIRM.pop(field, None)
                             continue
                         _DELTA_CONFIRM[field] = (val, count)
-                        return (f"{field}={val} delta={val - prev:+.1f} "
+                        if pending_delta_err is None:
+                            pending_delta_err = (
+                                f"{field}={val} delta={val - prev:+.1f} "
                                 f"exceeds ±{max_delta} from prev={prev} "
                                 f"(likely OCR misread; confirm {count}/{DELTA_CONFIRM_THRESHOLD})")
+                        continue
                     if over:
-                        return (f"{field}={val} delta={val - prev:+.1f} "
+                        if pending_delta_err is None:
+                            pending_delta_err = (
+                                f"{field}={val} delta={val - prev:+.1f} "
                                 f"exceeds ±{max_delta} from prev={prev} "
                                 "(likely OCR misread)")
+                        continue
                     if allow_delta_override:
                         _DELTA_CONFIRM.pop(field, None)
                 except ValueError:
                     pass
-    return None
+    return pending_delta_err
 
 def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref: Optional[list[bool]] = None) -> CycleResult:
     """One full cycle, gated by COORD.try_begin_cycle().
