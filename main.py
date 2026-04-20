@@ -203,10 +203,17 @@ BBOXES: dict[str, FieldSpec] = {
     "ww_ist_temp":   FieldSpec("warmwasser", (165, 178,  90, 28), FIELD_NUM,  "float"),
     "ww_soll_temp":  FieldSpec("warmwasser", (460, 215, 140, 28), FIELD_NUM,  "float"),
     "ww_modus":      FieldSpec("warmwasser", (290, 365, 150, 25), FIELD_TEXT, "str"),
-    # Betriebsstundenzähler page 3 — Wärmeverteilung (heat distribution counters)
+    # Betriebsstundenzähler page 3 — Wärmeverteilung.
+    # og_h + fussbodenheizung_h are DISABLED: the container's Debian tesseract
+    # 5.3.x consistently misreads them (og=31 real 36177, fbh=398831 real
+    # 39882) while producing correct reads on every other field on the page
+    # (rla_pumpe_h row). My local Arch tesseract 5.5.x reads the same captured
+    # PNG correctly, so it's a tesseract cross-version quirk on these two
+    # specific glyph combinations. See TODO: either pin tesseract in the
+    # Dockerfile or bundle tessdata_best to resolve.
     "rla_pumpe_h":         FieldSpec("betriebsstunden_p3", (410,  95, 140, 28), FIELD_NUM, "float"),
-    "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
-    "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
+    # "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float"),
+    # "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float"),
     # Heizkreis Fussbodenheizung (live floor-heating circuit) — rows ~5px higher than OG
     "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (365, 320, 80, 22), FIELD_NUM,  "float"),
     "fbh_vorlaufsolltemperatur": FieldSpec("heizkreise_fbh", (365, 350, 80, 24), FIELD_NUM,  "float"),
@@ -476,11 +483,6 @@ def ocr(img: Image.Image, region: tuple[int, int, int, int], config: str,
         # Grayscale-then-invert handles white-on-blue (status bars) much better
         # than RGB invert, which produces low-contrast yellow-on-yellow.
         c = ImageOps.invert(c.convert("L"))
-    # Normalise to grayscale then upscale 2x with LANCZOS. Grayscale first
-    # strips per-channel anti-aliasing noise that different tesseract builds
-    # (Debian 5.3.x in the container vs Arch 5.5.x locally) treat
-    # inconsistently on 2-digit glyphs.
-    c = c.convert("L")
     big = c.resize((c.width * 2, c.height * 2), Image.LANCZOS)
     return pytesseract.image_to_string(big, lang=lang, config=config).strip()
 
