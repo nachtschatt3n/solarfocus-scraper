@@ -276,8 +276,27 @@ MAX_DELTA_PER_CYCLE: dict[str, float] = {
     "fbh_mischerposition":         30.0,
     "ww_ist_temp":                  8.0,
     "ww_soll_temp":                50.0,   # DHW setpoint flips between day/night
-    # Counter fields not listed — their monotonic increase is already enforced
-    # by the COUNTER_FIELDS logic.
+    # Counter fields — monotonic check already catches decreases; delta here
+    # catches unreasonably large *increases* (OCR misreads that drop digits
+    # or grow them, e.g. og_h jumping 36165 → 398831 on a dropped thousands
+    # separator). Budget is generous: at 5-minute intervals, hour meters
+    # accrue ≤0.1 h even under pure-runtime use; 2.0 lets us catch up after
+    # a short VNC outage without false rejects.
+    "saugzuggeblaese_h":            2.0,
+    "lambdasonde_h":                2.0,
+    "waermetauscherreinigung_h":    2.0,
+    "zuendung_h":                   2.0,
+    "einschub_h":                   2.0,
+    "saugaustragung_h":             2.0,
+    "ascheaustragungsschnecke_h":   2.0,
+    "pelletsbetrieb_teillast_h":    2.0,
+    "pelletsbetrieb_h":             2.0,
+    "betriebsstunden_seit_wartung_h": 2.0,
+    "rla_pumpe_h":                  2.0,
+    "og_h":                         2.0,
+    "fussbodenheizung_h":           2.0,
+    "anzahl_kesselstarts":         10.0,   # max ~2 starts per 5min cycle; allow headroom
+    "pelletsverbrauch_kg":         20.0,   # peak burn ~2 kg/min
 }
 
 # Home Assistant discovery metadata per field.
