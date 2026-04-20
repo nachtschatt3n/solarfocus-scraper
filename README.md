@@ -26,6 +26,7 @@ and a `/healthz` suitable for k8s liveness/readiness probes.
 - **Betriebsstundenzähler p2 (5):** Pelletsbetrieb Teillast, Pelletsbetrieb, Kesselstarts, Betriebsstunden seit Wartung, Pelletsverbrauch (kg)
 - **Betriebsstundenzähler p3 / Wärmeverteilung (3):** RLA-Pumpe, OG Heizkreis, Fussbodenheizung
 - **Controls (1):** `switch.solarfocus_pellet_heater_scraper_pause` — toggle from HA to pause VNC access when you want to use the touchscreen yourself
+- **Alerts (4):** `binary_sensor.solarfocus_pellet_heater_alert_active`, plus `sensor.*_alert_title`, `sensor.*_alert_body`, `sensor.*_alert_last_seen` — the heater pops modal alerts ("KESSELREINIGUNG EMPFOHLEN!", "Pellet Mangel", etc.) that must be dismissed with OK. The scraper detects them by hashing the info icon, OCRs the title+body, publishes to MQTT, and clicks OK. Works for any future info-type alert too.
 
 Each sensor arrives with the right HA `device_class` (`temperature`, `duration`, `weight`) and `state_class` (`measurement` for live values, `total_increasing` for counters), so the Energy dashboard and long-term statistics work out of the box.
 
@@ -145,7 +146,12 @@ Images are pushed to `ghcr.io/nachtschatt3n/solarfocus-scraper:latest` on every 
 | `solarfocus/scraper/pause` | `on` \| `off` — read at the start of each cycle | yes |
 | `solarfocus/scraper/pause/set` | `on` \| `off` — HA writes here, scraper mirrors to `pause` | no |
 | `solarfocus/scraper/last_error_image` | base64 PNG, published on `navigation_failed` | yes |
+| `solarfocus/alert/active` | `on` \| `off` — modal alert currently showing on heater | yes |
+| `solarfocus/alert/title` | most recent alert's title (e.g. `Kesselreinigung`) | yes |
+| `solarfocus/alert/body` | most recent alert's body text | yes |
+| `solarfocus/alert/last_seen` | ISO8601 timestamp of last alert detection | yes |
 | `homeassistant/sensor/solarfocus_pellettop/<field>/config` | HA discovery JSON | yes |
+| `homeassistant/binary_sensor/solarfocus_pellettop/alert_active/config` | HA discovery JSON | yes |
 | `homeassistant/switch/solarfocus_pellettop/pause/config` | HA discovery JSON | yes |
 
 ## Prometheus metrics

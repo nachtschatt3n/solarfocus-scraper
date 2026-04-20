@@ -37,6 +37,15 @@ from vncdotool import api as vnc_api
 # reads on the small UI font.
 FIELD_NUM = "--psm 7 -c tessedit_char_whitelist=0123456789.,-"
 FIELD_TEXT = "--psm 7"
+# Multi-line German prose inside an alert modal — psm 6 treats the crop as
+# a block of text, keeping newlines in the OCR output.
+FIELD_PARAGRAPH = "--psm 6"
+
+# Bounding boxes inside the alert_modal screen. Not part of the BBOXES dict
+# because they're not published as regular sensors — they fire out-of-band when
+# a modal is detected, via run_cycle's _handle_alert_modal().
+ALERT_TITLE_BBOX = (20, 5, 600, 28)
+ALERT_BODY_BBOX  = (40, 140, 560, 180)
 
 # Navigation as a state machine.
 #
@@ -104,6 +113,20 @@ SCREENS: dict[str, Screen] = {
         hash_region=(195, 95, 290, 28),  # "Trinkwasserspeicher 1" title
         expected_hash="3e329f2a8fe5f37caa13d1f440f83af0dd8c3eb0bcc46c9f44b9a90823921279",
         parent="auswahlmenue",
+    ),
+    # Alert modals — Solarfocus pops these over any screen when maintenance or
+    # fault conditions fire (e.g. "KESSELREINIGUNG EMPFOHLEN!", "Pellet Mangel",
+    # ...). Hash region is the blue info icon centered at the top, which is the
+    # same graphic across every info-type alert — so the same fingerprint covers
+    # arbitrary future alert text. back_xy points at the OK button so the
+    # state-machine's generic "click back to escape unknown" path dismisses the
+    # modal automatically. run_cycle() additionally OCRs the body and publishes
+    # it to MQTT before dismissing.
+    "alert_modal": Screen(
+        hash_region=(290, 50, 60, 60),  # blue info "i" icon, shared across all info alerts
+        expected_hash="8168a4c150516591af7479070357376bb44c443b2efb8f1a3d00672b9dc3199e",
+        parent="main",           # dismissing takes us back to underlying screen; main is a safe retry anchor
+        back_xy=(320, 410),      # OK button
     ),
     # Live floor-heating heat-circuit screen. Reached via the right-arrow on
     # heizkreise_og. The standard back arrow at (35,30) is hidden behind the
@@ -538,6 +561,41 @@ def publish_discovery(broker: MqttBroker) -> None:
         "device": DEVICE_BLOCK,
     }, retain=True)
 
+    # Alert entities — binary_sensor for active flag, text sensors for the
+    # most recent title + body (retained, so they survive a scraper restart).
+    broker.publish(f"{MQTT_DISCOVERY_PREFIX}/binary_sensor/{MQTT_DEVICE_ID}/alert_active/config", {
+        "name": "Alert Active",
+        "unique_id": f"{MQTT_DEVICE_ID}_alert_active",
+        "object_id": f"{MQTT_DEVICE_ID}_alert_active",
+        "state_topic": f"{MQTT_TOPIC_PREFIX}/alert/active",
+        "payload_on": "on",
+        "payload_off": "off",
+        "device_class": "problem",
+        "device": DEVICE_BLOCK,
+    }, retain=True)
+    broker.publish(f"{MQTT_DISCOVERY_PREFIX}/sensor/{MQTT_DEVICE_ID}/alert_title/config", {
+        "name": "Alert Title",
+        "unique_id": f"{MQTT_DEVICE_ID}_alert_title",
+        "object_id": f"{MQTT_DEVICE_ID}_alert_title",
+        "state_topic": f"{MQTT_TOPIC_PREFIX}/alert/title",
+        "device": DEVICE_BLOCK,
+    }, retain=True)
+    broker.publish(f"{MQTT_DISCOVERY_PREFIX}/sensor/{MQTT_DEVICE_ID}/alert_body/config", {
+        "name": "Alert Body",
+        "unique_id": f"{MQTT_DEVICE_ID}_alert_body",
+        "object_id": f"{MQTT_DEVICE_ID}_alert_body",
+        "state_topic": f"{MQTT_TOPIC_PREFIX}/alert/body",
+        "device": DEVICE_BLOCK,
+    }, retain=True)
+    broker.publish(f"{MQTT_DISCOVERY_PREFIX}/sensor/{MQTT_DEVICE_ID}/alert_last_seen/config", {
+        "name": "Alert Last Seen",
+        "unique_id": f"{MQTT_DEVICE_ID}_alert_last_seen",
+        "object_id": f"{MQTT_DEVICE_ID}_alert_last_seen",
+        "state_topic": f"{MQTT_TOPIC_PREFIX}/alert/last_seen",
+        "device_class": "timestamp",
+        "device": DEVICE_BLOCK,
+    }, retain=True)
+
 # =============================================================================
 # Coordinator — single owner of state machine + cycle exclusion
 # =============================================================================
@@ -942,6 +1000,39 @@ def _ocr_all(img_by_screen: dict[str, Image.Image]) -> dict[str, object]:
             out["fill_level_percent"] = fill_level_percent(main_img)
     return out
 
+def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
+                        max_dismissals: int = 3) -> list[dict]:
+    """If the heater is displaying an alert modal, OCR the title+body, publish to
+    MQTT, click OK to dismiss, and repeat — some alerts can stack (e.g. two
+    maintenance reminders). Returns a list of {title, body, ts_iso} dicts, one
+    per dismissal, empty if no alerts were present.
+    """
+    seen: list[dict] = []
+    for _ in range(max_dismissals):
+        img = vnc_capture(client)
+        if _identify_screen(img) != "alert_modal":
+            break
+        title = ocr(img, ALERT_TITLE_BBOX, FIELD_TEXT, invert=True).strip()
+        body = ocr(img, ALERT_BODY_BBOX, FIELD_PARAGRAPH, lang="deu").strip()
+        alert = {
+            "title": title,
+            "body": body,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        seen.append(alert)
+        event(logging.WARNING, "alert_detected", "heater alert modal",
+              title=title, body=body[:120])
+        if broker and not dry_run:
+            broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "on", retain=True)
+            broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/title", title, retain=True)
+            broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/body", body, retain=True)
+            broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/last_seen", alert["ts"], retain=True)
+        # Dismiss via OK button (back_xy on the alert_modal screen).
+        vnc_click(client, *SCREENS["alert_modal"].back_xy)
+        time.sleep(CLICK_DELAY_SECONDS)
+    return seen
+
+
 def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker]) -> Optional[str]:
     """Return error string on failure, else None."""
     for field, val in values.items():
@@ -997,6 +1088,17 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
             return CycleResult(status="busy", values={})
 
         try:
+            # First, dismiss any alert modal(s) currently on screen. These pop
+            # over any screen and block navigation until OK is clicked. The
+            # helper publishes each one to MQTT before dismissing.
+            COORD.set_phase("alerts")
+            alerts = _handle_alert_modal(client, broker, dry_run)
+            if broker and not dry_run and not alerts:
+                # No alert this cycle — clear the retained active flag so HA
+                # reflects the current state. Title/body are left retained so
+                # the last alert's text persists as reference.
+                broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "off", retain=True)
+
             img_by_screen: dict[str, Image.Image] = {}
             # Visit each screen referenced by BBOXES (plus `main` for the fill bar).
             screens_needed = sorted({spec.screen for spec in BBOXES.values()} | {"main"})
