@@ -110,7 +110,13 @@ SCREENS: dict[str, Screen] = {
         hash_region=(85, 5, 470, 30),  # "Betriebsstundenzähler Wärmeverteilung" header
         expected_hash="ac5029cc4aea6d21720a014609bcbba0dd08ea78c04479b1efce838028f4b3d1",
         parent="kundenmenue",
-        ocr_text="rmeverteilung",  # "Wärmeverteilung" — umlaut-tolerant
+        # Persistent alert banners ("Pelletsmangel im Lagerraum!" etc.) can
+        # overwrite the header text, which breaks the hash and makes the
+        # old header-based ocr_text ("rmeverteilung") un-findable. Move OCR
+        # fallback into the body — the "RLA Pumpe" label at (~0,95) is the
+        # top row of p3's heat-distribution table and unique to this page.
+        ocr_region=(0, 95, 180, 28),
+        ocr_text="RLA",
     ),
     "kessel": Screen(
         hash_region=(10, 215, 85, 30),  # "Kessel" label at left
