@@ -67,6 +67,14 @@ class Screen:
     expected_hash: str
     parent: Optional[str] = None  # screen reached by clicking back_xy
     back_xy: tuple[int, int] = BACK_ARROW_XY  # override when standard back arrow isn't present
+    # OCR fallback used when `expected_hash` doesn't match. `_identify_screen`
+    # OCRs `ocr_region` (defaulting to `hash_region`) and accepts the screen if
+    # `ocr_text` appears as a case-insensitive substring of the decoded string.
+    # This survives VNC compression jitter, firmware UI tweaks, and other
+    # pixel-level noise that silently invalidated the hash. Leave ocr_text=None
+    # to opt a screen out of OCR fallback (e.g. icon-only modals).
+    ocr_region: Optional[tuple[int, int, int, int]] = None
+    ocr_text: Optional[str] = None
 
 SCREENS: dict[str, Screen] = {
     "main": Screen(
@@ -78,41 +86,49 @@ SCREENS: dict[str, Screen] = {
         hash_region=(85, 5, 200, 30),  # header bar text
         expected_hash="420b8d677a88f5868bb1e18a021857ddb2ad73283ee9a57acac9a886cb08299d",
         parent="main",
+        ocr_text="Auswahl",  # "Auswahlmenü" — umlaut-tolerant substring
     ),
     "kundenmenue": Screen(
         hash_region=(85, 5, 200, 30),
         expected_hash="1e1ff73b4be210f3bc7998a69f1b3e9605c6c0dffb0f879f7fd3ffdec26abdaf",
         parent="auswahlmenue",
+        ocr_text="Kunden",  # "Kundenmenü"
     ),
     "betriebsstunden_p1": Screen(
         hash_region=(0, 80, 160, 22),  # "Saugzuggebläse" label
         expected_hash="f90b9df97fd64ed99934dfff36eccdfbe4cccb6f87b08d80582f7809e924fc70",
         parent="kundenmenue",
+        ocr_text="Saugzug",
     ),
     "betriebsstunden_p2": Screen(
         hash_region=(0, 80, 220, 22),  # "Pelletsbetrieb Teillast" label
         expected_hash="538bd98a255a7309640989d834e15e3633f2f01c9ff029db3abadfeef9847485",
         parent="kundenmenue",
+        ocr_text="Pelletsbetrieb",
     ),
     "betriebsstunden_p3": Screen(
         hash_region=(85, 5, 470, 30),  # "Betriebsstundenzähler Wärmeverteilung" header
         expected_hash="ac5029cc4aea6d21720a014609bcbba0dd08ea78c04479b1efce838028f4b3d1",
         parent="kundenmenue",
+        ocr_text="rmeverteilung",  # "Wärmeverteilung" — umlaut-tolerant
     ),
     "kessel": Screen(
         hash_region=(10, 215, 85, 30),  # "Kessel" label at left
         expected_hash="a9d5af96364628b8634fecb7b68f8738185b9cc503f3e7230dbfc0efada7fc9a",
         parent="auswahlmenue",
+        ocr_text="Kessel",
     ),
     "heizkreise_og": Screen(
         hash_region=(270, 65, 80, 30),  # "OG" title text
         expected_hash="e111c25ac599314f79175b5fe68a832f68eb867dcb2e09fe08c29e1b7d01090e",
         parent="auswahlmenue",
+        ocr_text="OG",
     ),
     "warmwasser": Screen(
         hash_region=(195, 95, 290, 28),  # "Trinkwasserspeicher 1" title
         expected_hash="3e329f2a8fe5f37caa13d1f440f83af0dd8c3eb0bcc46c9f44b9a90823921279",
         parent="auswahlmenue",
+        ocr_text="Trinkwasserspeicher",
     ),
     # Alert modals — Solarfocus pops these over any screen when maintenance or
     # fault conditions fire (e.g. "KESSELREINIGUNG EMPFOHLEN!", "Pellet Mangel",
@@ -137,6 +153,7 @@ SCREENS: dict[str, Screen] = {
         expected_hash="15f80f0d9dc9c7f678813db6be2a91c53162bd7d6c5d2b7727759c135663c9f2",
         parent="heizkreise_og",
         back_xy=(45, 130),
+        ocr_text="Fussbodenheizung",
     ),
 }
 
@@ -440,6 +457,28 @@ m_up = Gauge("solarfocus_scraper_up", "Process is running")
 m_last_run = Gauge("solarfocus_scraper_last_run_timestamp_seconds", "Unix time of last completed cycle")
 m_last_dur = Gauge("solarfocus_scraper_last_run_duration_seconds", "Duration of last cycle in seconds")
 m_runs = Counter("solarfocus_scraper_runs_total", "Cycles by status", ["status"])
+
+# Screen-identification resilience metrics. Before these, an unknown-screen
+# incident manifested as a generic "navigation_failed" run status with no hint
+# of why — hash-match failure vs. unknown sub-screen vs. genuinely-offline heater
+# all looked identical. Splitting them lets alerts target the actual cause.
+m_screen_ident = Counter(
+    "solarfocus_scraper_screen_identified_total",
+    "Screens identified by the recognizer, split by detection method",
+    ["screen", "via"],  # via: "hash" | "ocr"
+)
+m_screen_unknown = Counter(
+    "solarfocus_scraper_screen_unknown_total",
+    "Captures where no known screen matched (neither hash nor OCR)",
+)
+m_nav_escape = Counter(
+    "solarfocus_scraper_nav_escape_total",
+    "navigate_to triggered escape-hatch after 3 consecutive unknown screens",
+)
+m_nav_abort = Counter(
+    "solarfocus_scraper_nav_abort_total",
+    "navigate_to aborted after 5 consecutive unknown screens",
+)
 
 # =============================================================================
 # VNC helpers
@@ -1136,12 +1175,50 @@ class _NavFail(Exception):
         super().__init__(f"could not reach {screen}")
 
 def _identify_screen(img: Image.Image) -> Optional[str]:
-    """Return the name of the matching known screen, or None."""
+    """Return the name of the matching known screen, or None.
+
+    Two-stage match:
+      1. Fast path — exact SHA256 of `hash_region`. Zero-cost but brittle; any
+         VNC compression jitter or firmware-driven pixel shift invalidates it.
+      2. Fallback — OCR `ocr_region` (defaults to `hash_region`) and look for
+         `ocr_text` as a case-insensitive substring. Used to be the source of
+         the "unknown screen, tapping back" incident: hash had drifted on a
+         perfectly-normal screen and we kept blindly tapping back forever.
+
+    When the OCR path matches but the hash didn't, log the drifted hash at
+    WARNING so the operator can refresh `expected_hash` in source (self-heal).
+    """
+    # Fast path — exact hash
     for name, screen in SCREENS.items():
         if not screen.expected_hash:
             continue
         if region_hash(img, screen.hash_region) == screen.expected_hash:
+            m_screen_ident.labels(screen=name, via="hash").inc()
             return name
+    # Fallback — OCR title/distinctive text for screens that opted in.
+    for name, screen in SCREENS.items():
+        if not screen.ocr_text:
+            continue
+        region = screen.ocr_region or screen.hash_region
+        try:
+            text = ocr(img, region, FIELD_TEXT, lang="deu")
+        except Exception as e:
+            event(logging.DEBUG, "identify_ocr_failed", "OCR attempt failed",
+                  screen=name, error=str(e))
+            continue
+        if screen.ocr_text.lower() in text.lower():
+            m_screen_ident.labels(screen=name, via="ocr").inc()
+            if screen.expected_hash:
+                new_hash = region_hash(img, screen.hash_region)
+                if new_hash != screen.expected_hash:
+                    event(logging.WARNING, "screen_hash_drift",
+                          "OCR matched but hash differs — update expected_hash in main.py",
+                          screen=name,
+                          new_hash=new_hash,
+                          old_hash=screen.expected_hash,
+                          ocr_text_seen=text.strip()[:120])
+            return name
+    m_screen_unknown.inc()
     return None
 
 def _shortest_path(start: str, end: str) -> Optional[list[str]]:
@@ -1172,11 +1249,22 @@ def navigate_to(client, target: str, max_steps: int = 12) -> bool:
     """Drive VNC clicks until `_identify_screen()` returns `target`.
 
     Loop: detect current → BFS to target → click first edge → repeat.
-    On unknown screen (None), tap back arrow to escape and retry.
+
+    Unknown-screen recovery (identify returned None):
+      - streak < 3: simple tap of BACK_ARROW_XY (covers most in-flow
+        transitional states where a redraw is in progress).
+      - streak == 3: escape-hatch — tap (5,5) + BACK_ARROW_XY + 2s wait.
+        A few heater screens render the back arrow outside the default
+        bbox, or have overlay widgets covering it; the corner-tap clears
+        most of those.
+      - streak >= 5: abort the cycle cleanly rather than flailing
+        forever. Before this, navigate_to could eat a cycle indefinitely
+        tapping back on a screen its templates had no word for.
     """
     if target not in SCREENS:
         event(logging.ERROR, "navigate_unknown_target", "no such screen", target=target)
         return False
+    unknown_streak = 0
     for step in range(max_steps):
         img = vnc_capture(client)
         current = _identify_screen(img)
@@ -1184,12 +1272,31 @@ def navigate_to(client, target: str, max_steps: int = 12) -> bool:
             event(logging.DEBUG, "navigate_reached", "at target", target=target, steps=step)
             return True
         if current is None:
+            unknown_streak += 1
+            if unknown_streak >= 5:
+                m_nav_abort.inc()
+                event(logging.ERROR, "navigate_unknown_abort",
+                      "5 consecutive unknowns — aborting before we drift further",
+                      step=step, target=target)
+                return False
+            if unknown_streak == 3:
+                m_nav_escape.inc()
+                event(logging.WARNING, "navigate_escape",
+                      "3 consecutive unknowns — trying escape hatch (corner + back)",
+                      step=step, target=target)
+                vnc_click(client, 5, 5)
+                time.sleep(CLICK_DELAY_SECONDS)
+                vnc_click(client, *BACK_ARROW_XY)
+                time.sleep(2.0)
+                continue
             event(logging.INFO, "navigate_unknown_screen",
                   "unknown screen, tapping back",
-                  step=step, target=target)
+                  step=step, target=target, streak=unknown_streak)
             vnc_click(client, *BACK_ARROW_XY)
             time.sleep(CLICK_DELAY_SECONDS)
             continue
+        # Identified a known screen — reset the unknown streak.
+        unknown_streak = 0
         path = _shortest_path(current, target)
         if not path or len(path) < 2:
             event(logging.ERROR, "navigate_no_path", "no route",
