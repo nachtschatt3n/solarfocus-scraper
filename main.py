@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape as html_escape
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -986,8 +986,13 @@ class Coordinator:
         self.cycle_started_ts: float = 0.0
         self.cycle_completed_ts: float = 0.0
         self.last_duration_s: float = 0.0
-        self.last_status: str = "(none)"         # ok|busy|navigation_failed|sanity_failed|paused|error
+        self.last_status: str = "(none)"         # ok|busy|navigation_failed|sanity_failed|paused|maintenance|error
         self.last_error: Optional[str] = None
+        # Maintenance mode: in-process kill switch toggled from the status page's
+        # Stop/Start buttons. Deliberately not MQTT-backed so it works even when
+        # the broker is unreachable. Not persisted across pod restarts — a fresh
+        # pod comes back in normal running mode.
+        self.maintenance_mode: bool = False
         # State machine snapshot
         self.current_screen: Optional[str] = None
         self.target_screen: Optional[str] = None
@@ -1015,7 +1020,7 @@ class Coordinator:
     def end_cycle(self, status: str, error: Optional[str] = None) -> None:
         with self.state_lock:
             self.cycle_running = False
-            self.cycle_phase = "done" if status in ("ok", "paused") else "error"
+            self.cycle_phase = "done" if status in ("ok", "paused", "maintenance", "partial") else "error"
             self.last_status = status
             if error is not None:
                 self.last_error = error
@@ -1052,6 +1057,14 @@ class Coordinator:
         with self.state_lock:
             self.values[field] = ValueRecord(value=value, ts=time.time())
 
+    def set_maintenance(self, on: bool) -> None:
+        with self.state_lock:
+            self.maintenance_mode = on
+
+    def is_maintenance(self) -> bool:
+        with self.state_lock:
+            return self.maintenance_mode
+
     def snapshot(self) -> dict:
         with self.state_lock:
             return {
@@ -1067,6 +1080,7 @@ class Coordinator:
                 "target_screen": self.target_screen,
                 "last_screenshot_ts": self.last_screenshot_ts,
                 "last_screenshot_screen": self.last_screenshot_screen,
+                "maintenance_mode": self.maintenance_mode,
                 "values": dict(self.values),  # shallow copy is fine; ValueRecord is immutable enough
             }
 
@@ -1105,122 +1119,369 @@ def _fmt_value(v: object) -> str:
 
 
 def render_status_html(snap: dict) -> str:
-    now = time.time()
-    cycle_age = now - snap["cycle_completed_ts"] if snap["cycle_completed_ts"] else None
-    cycle_age_s = _fmt_age(cycle_age) if cycle_age is not None else "—"
-    started_iso = (
-        datetime.fromtimestamp(snap["cycle_completed_ts"], timezone.utc).isoformat(timespec="seconds")
-        if snap["cycle_completed_ts"] else "—"
-    )
-    screenshot_age = (
-        _fmt_age(now - snap["last_screenshot_ts"]) if snap["last_screenshot_ts"] else "—"
-    )
-    status_class = {
-        "ok": "ok", "paused": "ok", "busy": "warn",
-        "navigation_failed": "err", "sanity_failed": "err", "error": "err",
-    }.get(snap["last_status"], "")
-    running_badge = (
-        f'<span class="badge run">running: {html_escape(snap["cycle_phase"])} '
-        f'{html_escape(snap["cycle_phase_detail"])}</span>'
-        if snap["cycle_running"] else ""
-    )
-    target_html = (
-        f' → <strong>{html_escape(snap["target_screen"])}</strong>'
-        if snap["target_screen"] else ""
-    )
-    err_html = (
-        f'<div class="err-banner">⚠ last error: {html_escape(snap["last_error"])}</div>'
-        if snap["last_error"] else ""
-    )
+    """Return the static HTML skeleton. Live values come from /events (SSE)
+    and are patched into named elements by the embedded JS — so the returned
+    HTML does not depend on `snap` at all. The parameter is kept for the
+    historical call signature."""
+    del snap  # unused; live data arrives via SSE
 
-    # Values table
-    rows = []
-    for field in sorted(snap["values"].keys()):
-        rec: ValueRecord = snap["values"][field]
-        meta = SENSORS.get(field)
-        unit = meta.unit if meta and meta.unit else ""
-        rows.append(
-            f"<tr><td>{html_escape(field)}</td>"
-            f"<td class='val'>{_fmt_value(rec.value)} {html_escape(unit)}</td>"
-            f"<td>{rec.iso()}</td>"
-            f"<td>{_fmt_age(rec.age_s())}</td></tr>"
-        )
-    values_table = "\n".join(rows) or "<tr><td colspan='4'><em>no values yet</em></td></tr>"
-
-    # Screen registry
-    screen_rows = []
+    # Static portions: screens + edges tables are compile-time data, not
+    # runtime state, so we can bake them in server-side once.
+    screen_rows_parts: list[str] = []
     for name, s in SCREENS.items():
-        cal = "yes" if s.expected_hash else "<span class='warn'>TODO</span>"
+        cal = ('<span class="text-emerald-700">yes</span>' if s.expected_hash
+               else '<span class="text-amber-700">TODO</span>')
         bbox_count = sum(1 for spec in BBOXES.values() if spec.screen == name)
-        on_now = " current" if name == snap["current_screen"] else ""
-        screen_rows.append(
-            f"<tr class='screen{on_now}'><td>{html_escape(name)}</td>"
-            f"<td>{html_escape(s.parent or '—')}</td>"
-            f"<td>{cal}</td>"
-            f"<td>{bbox_count}</td></tr>"
+        screen_rows_parts.append(
+            f'<tr data-screen="{html_escape(name)}" class="border-b border-slate-100 transition">'
+            f'<td class="py-1 pr-2 font-mono">{html_escape(name)}</td>'
+            f'<td class="py-1 pr-2 text-slate-600">{html_escape(s.parent or "—")}</td>'
+            f'<td class="py-1 pr-2">{cal}</td>'
+            f'<td class="py-1 text-slate-600">{bbox_count}</td></tr>'
         )
+    screens_tbody = "".join(screen_rows_parts)
 
-    edge_rows = "\n".join(
-        f"<li>{html_escape(src)} → {html_escape(dst)} @ ({xy[0]}, {xy[1]})</li>"
+    edge_rows_parts = "".join(
+        f'<li>{html_escape(src)} <span class="text-slate-400">→</span> {html_escape(dst)} '
+        f'<span class="text-slate-400">@</span> ({xy[0]}, {xy[1]})</li>'
         for (src, dst), xy in EDGES.items()
     )
 
-    return f"""<!doctype html>
-<html><head>
+    # The template below is a plain string (not an f-string) so Tailwind
+    # arbitrary-value syntax like `max-h-[500px]` and JS object literals
+    # don't need brace-doubling. Substitution happens via str.replace on
+    # well-named sentinels.
+    return _STATUS_HTML_TEMPLATE \
+        .replace("__SCREENS_COUNT__", str(len(SCREENS))) \
+        .replace("__EDGES_COUNT__", str(len(EDGES))) \
+        .replace("__SCREENS_TBODY__", screens_tbody) \
+        .replace("__EDGES_LIST__", edge_rows_parts)
+
+
+_STATUS_HTML_TEMPLATE = """<!doctype html>
+<html lang="en" class="h-full">
+<head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="5">
 <title>Solarfocus Scraper</title>
-<style>
-  body {{ font-family: -apple-system, system-ui, sans-serif; margin: 1em; max-width: 1200px; }}
-  h1 {{ margin: 0 0 0.5em; font-size: 1.4em; }}
-  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5em; }}
-  .status-line {{ font-size: 0.95em; color: #444; margin-bottom: 1em; }}
-  .badge {{ padding: 2px 8px; border-radius: 4px; font-size: 0.85em; }}
-  .badge.ok  {{ background: #d4f4d4; color: #1a4d1a; }}
-  .badge.warn {{ background: #fff3cd; color: #6b5400; }}
-  .badge.err {{ background: #f8d7da; color: #721c24; }}
-  .badge.run {{ background: #cce5ff; color: #004085; }}
-  .err-banner {{ background: #f8d7da; color: #721c24; padding: 8px; border-radius: 4px; margin: 0.5em 0; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: 0.85em; }}
-  th, td {{ padding: 4px 8px; text-align: left; border-bottom: 1px solid #eee; }}
-  th {{ background: #f5f5f5; }}
-  td.val {{ font-family: ui-monospace, monospace; font-weight: 600; }}
-  tr.screen.current {{ background: #e7f1ff; font-weight: 600; }}
-  img.screenshot {{ max-width: 100%; border: 1px solid #ccc; border-radius: 4px; }}
-  .warn {{ color: #b06a00; }}
-  ul.edges {{ font-family: ui-monospace, monospace; font-size: 0.8em; padding-left: 1.5em; }}
-  h2 {{ font-size: 1em; margin: 1em 0 0.4em; }}
-</style></head>
-<body>
-<h1>Solarfocus Scraper {running_badge}</h1>
-<div class="status-line">
-  Last cycle: <span class="badge {status_class}">{html_escape(snap["last_status"])}</span>
-  &middot; finished {started_iso} ({cycle_age_s} ago)
-  &middot; took {snap["last_duration_s"]:.1f}s
-  &middot; <strong>current:</strong> {html_escape(snap["current_screen"] or "—")}{target_html}
-</div>
-{err_html}
-<div class="grid">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<script src="/static/tailwind.js"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-full antialiased">
+<div class="max-w-7xl mx-auto p-6 space-y-4">
+
+<!-- Header: title + action buttons -->
+<header class="flex flex-wrap items-center justify-between gap-3">
   <div>
-    <h2>Last screenshot ({html_escape(snap["last_screenshot_screen"] or "—")} · {screenshot_age} ago)</h2>
-    <img class="screenshot" src="/screenshot.png?t={snap['last_screenshot_ts']:.0f}">
+    <h1 class="text-2xl font-semibold tracking-tight">Solarfocus Scraper</h1>
+    <p class="text-sm text-slate-500">Live status · pushes via server-sent events</p>
   </div>
-  <div>
-    <h2>Values ({len(snap["values"])})</h2>
-    <table>
-      <tr><th>field</th><th>value</th><th>recorded (UTC)</th><th>age</th></tr>
-      {values_table}
-    </table>
+  <div class="flex items-center gap-2">
+    <span id="running-badge" class="hidden inline-flex items-center gap-1.5 rounded-md bg-sky-100 text-sky-800 px-2.5 py-1 text-xs font-medium ring-1 ring-sky-200">
+      <span class="inline-block w-2 h-2 rounded-full bg-sky-500 animate-pulse"></span>
+      <span id="running-phase">running</span>
+    </span>
+    <span id="maintenance-badge" class="hidden inline-flex items-center gap-1.5 rounded-md bg-amber-100 text-amber-900 px-2.5 py-1 text-xs font-semibold ring-1 ring-amber-300">
+      ⏸ maintenance
+    </span>
+    <button id="btn-start" type="button"
+      class="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 text-sm font-medium shadow-sm transition disabled:opacity-50 disabled:cursor-not-allowed">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path d="M6 4l10 6-10 6V4z"/></svg>
+      Start
+    </button>
+    <button id="btn-stop" type="button"
+      class="inline-flex items-center gap-1.5 rounded-md bg-rose-600 hover:bg-rose-500 text-white px-3 py-1.5 text-sm font-medium shadow-sm transition disabled:opacity-50 disabled:cursor-not-allowed">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="4" width="10" height="12" rx="1"/></svg>
+      Stop
+    </button>
+  </div>
+</header>
+
+<!-- Status strip -->
+<div class="bg-white rounded-lg shadow-sm ring-1 ring-slate-200 p-4">
+  <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+    <span class="text-slate-500">Last cycle</span>
+    <span id="status-badge" class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium bg-slate-100 text-slate-600">—</span>
+    <span class="text-slate-400">·</span>
+    <span class="text-slate-500">finished <span id="cycle-iso" class="text-slate-700 tabular-nums">—</span> (<span id="cycle-age" class="text-slate-700 tabular-nums">—</span> ago)</span>
+    <span class="text-slate-400">·</span>
+    <span class="text-slate-500">duration <span id="cycle-duration" class="text-slate-700 tabular-nums">—</span></span>
+    <span class="text-slate-400">·</span>
+    <span class="text-slate-500">current <strong id="current-screen" class="text-slate-900 font-mono">—</strong><span id="target-screen" class="text-slate-600 font-mono"></span></span>
+  </div>
+  <div id="error-banner" class="hidden mt-3 rounded-md bg-rose-50 border border-rose-200 text-rose-800 px-3 py-2 text-sm">
+    <strong>⚠ last error:</strong> <span id="error-text" class="font-mono"></span>
   </div>
 </div>
-<h2>Screens ({len(SCREENS)})</h2>
-<table>
-  <tr><th>name</th><th>parent (back)</th><th>calibrated</th><th>BBOXes</th></tr>
-  {''.join(screen_rows)}
-</table>
-<h2>Edges ({len(EDGES)})</h2>
-<ul class="edges">{edge_rows}</ul>
-</body></html>"""
+
+<!-- Grid: screenshot + values -->
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+  <div class="bg-white rounded-lg shadow-sm ring-1 ring-slate-200 p-4">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="font-semibold text-sm text-slate-700">Last screenshot</h2>
+      <span class="text-xs text-slate-500"><span id="screenshot-screen" class="font-mono">—</span> · <span id="screenshot-age" class="tabular-nums">—</span> ago</span>
+    </div>
+    <img id="screenshot" class="w-full rounded-md ring-1 ring-slate-200" src="/screenshot.png" alt="heater screen">
+  </div>
+  <div class="bg-white rounded-lg shadow-sm ring-1 ring-slate-200 p-4">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="font-semibold text-sm text-slate-700">Values <span id="values-count" class="text-slate-400 font-normal">(0)</span></h2>
+      <input id="values-filter" type="search" placeholder="filter…"
+        class="text-xs rounded-md border border-slate-300 px-2 py-1 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-500">
+    </div>
+    <div class="max-h-[560px] overflow-y-auto">
+      <table class="w-full text-xs">
+        <thead class="sticky top-0 bg-white border-b border-slate-200">
+          <tr>
+            <th class="text-left py-1 pr-2 font-semibold text-slate-600">field</th>
+            <th class="text-left py-1 pr-2 font-semibold text-slate-600">value</th>
+            <th class="text-left py-1 font-semibold text-slate-600">age</th>
+          </tr>
+        </thead>
+        <tbody id="values-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Screens (collapsible) -->
+<details class="bg-white rounded-lg shadow-sm ring-1 ring-slate-200 p-4">
+  <summary class="font-semibold text-sm text-slate-700 cursor-pointer select-none">Screens <span class="text-slate-400 font-normal">(__SCREENS_COUNT__)</span></summary>
+  <table class="w-full text-xs mt-3">
+    <thead>
+      <tr class="border-b border-slate-200">
+        <th class="text-left py-1 pr-2 font-semibold text-slate-600">name</th>
+        <th class="text-left py-1 pr-2 font-semibold text-slate-600">parent</th>
+        <th class="text-left py-1 pr-2 font-semibold text-slate-600">calibrated</th>
+        <th class="text-left py-1 font-semibold text-slate-600">bboxes</th>
+      </tr>
+    </thead>
+    <tbody id="screens-tbody">__SCREENS_TBODY__</tbody>
+  </table>
+</details>
+
+<!-- Edges (collapsible) -->
+<details class="bg-white rounded-lg shadow-sm ring-1 ring-slate-200 p-4">
+  <summary class="font-semibold text-sm text-slate-700 cursor-pointer select-none">Edges <span class="text-slate-400 font-normal">(__EDGES_COUNT__)</span></summary>
+  <ul class="mt-3 font-mono text-xs text-slate-700 space-y-0.5 pl-4 list-disc">
+    __EDGES_LIST__
+  </ul>
+</details>
+
+<footer class="text-xs text-slate-400 pt-2 pb-8 text-center">
+  <span id="sse-status">connecting…</span>
+</footer>
+
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let lastScreenshotTs = 0;
+  let lastSnap = null;
+
+  const STATUS_STYLES = {
+    ok:                'bg-emerald-100 text-emerald-800 ring-1 ring-emerald-200',
+    partial:           'bg-sky-100 text-sky-800 ring-1 ring-sky-200',
+    paused:            'bg-slate-200 text-slate-700 ring-1 ring-slate-300',
+    maintenance:       'bg-amber-100 text-amber-900 ring-1 ring-amber-300',
+    busy:              'bg-amber-100 text-amber-900 ring-1 ring-amber-300',
+    navigation_failed: 'bg-rose-100 text-rose-800 ring-1 ring-rose-200',
+    sanity_failed:     'bg-rose-100 text-rose-800 ring-1 ring-rose-200',
+    error:             'bg-rose-100 text-rose-800 ring-1 ring-rose-200',
+  };
+
+  const fmtAge = s => {
+    if (s == null || !isFinite(s) || s < 0) return '—';
+    if (s < 60)   return Math.round(s) + 's';
+    if (s < 3600) return Math.floor(s/60) + 'm' + Math.round(s%60).toString().padStart(2,'0') + 's';
+    return (s/3600).toFixed(1) + 'h';
+  };
+
+  const fmtVal = v => {
+    if (v === null || v === undefined) return '—';
+    if (v === true)  return '●';
+    if (v === false) return '○';
+    return String(v);
+  };
+
+  const valClass = v => {
+    if (v === true)  return 'font-mono font-semibold text-emerald-600 text-base leading-none';
+    if (v === false) return 'font-mono font-semibold text-rose-600 text-base leading-none';
+    return 'font-mono font-semibold text-slate-900';
+  };
+
+  function update(snap) {
+    lastSnap = snap;
+
+    // Running badge
+    const rb = $('running-badge');
+    if (snap.cycle_running) {
+      rb.classList.remove('hidden');
+      $('running-phase').textContent =
+        snap.cycle_phase + (snap.cycle_phase_detail ? ' ' + snap.cycle_phase_detail : '');
+    } else {
+      rb.classList.add('hidden');
+    }
+
+    // Maintenance badge + button states
+    const inMaint = !!snap.maintenance_mode;
+    $('maintenance-badge').classList.toggle('hidden', !inMaint);
+    $('btn-start').disabled = !inMaint;
+    $('btn-stop').disabled = inMaint;
+
+    // Status badge
+    const sb = $('status-badge');
+    const s = snap.last_status || '—';
+    sb.textContent = s;
+    sb.className = 'inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ' +
+                   (STATUS_STYLES[s] || 'bg-slate-100 text-slate-600');
+
+    // Cycle stats
+    if (snap.cycle_completed_ts) {
+      $('cycle-iso').textContent =
+        new Date(snap.cycle_completed_ts * 1000).toISOString().slice(0, 19).replace('T', ' ');
+    }
+    $('cycle-age').textContent = snap.cycle_completed_ts
+      ? fmtAge((Date.now() / 1000) - snap.cycle_completed_ts) : '—';
+    $('cycle-duration').textContent = snap.last_duration_s
+      ? snap.last_duration_s.toFixed(1) + 's' : '—';
+    $('current-screen').textContent = snap.current_screen || '—';
+    $('target-screen').textContent = snap.target_screen ? ' → ' + snap.target_screen : '';
+
+    // Error banner
+    const eb = $('error-banner');
+    if (snap.last_error) {
+      eb.classList.remove('hidden');
+      $('error-text').textContent = snap.last_error;
+    } else {
+      eb.classList.add('hidden');
+    }
+
+    // Screenshot — only reload src when ts changed, so the image doesn't flicker
+    if (snap.last_screenshot_ts && snap.last_screenshot_ts !== lastScreenshotTs) {
+      lastScreenshotTs = snap.last_screenshot_ts;
+      $('screenshot').src = '/screenshot.png?t=' + lastScreenshotTs;
+      $('screenshot-screen').textContent = snap.last_screenshot_screen || '—';
+    }
+    if (snap.last_screenshot_ts) {
+      $('screenshot-age').textContent =
+        fmtAge((Date.now() / 1000) - snap.last_screenshot_ts);
+    }
+
+    // Highlight current screen row in the screens table
+    document.querySelectorAll('tr[data-screen]').forEach(tr => {
+      const isCurrent = tr.dataset.screen === snap.current_screen;
+      tr.classList.toggle('bg-sky-50', isCurrent);
+      tr.classList.toggle('font-semibold', isCurrent);
+    });
+
+    // Values table: diff-patch in place so scroll position is kept
+    const keys = Object.keys(snap.values || {}).sort();
+    $('values-count').textContent = '(' + keys.length + ')';
+    const tbody = $('values-tbody');
+    const existing = new Map(Array.from(tbody.children).map(tr => [tr.dataset.field, tr]));
+    for (const [field, tr] of existing) {
+      if (!snap.values[field]) tr.remove();
+    }
+    let prev = null;
+    for (const field of keys) {
+      const rec = snap.values[field];
+      let tr = existing.get(field);
+      if (!tr) {
+        tr = document.createElement('tr');
+        tr.dataset.field = field;
+        tr.className = 'border-b border-slate-100';
+        tr.innerHTML =
+          '<td class="py-1 pr-2 font-mono text-slate-700"></td>' +
+          '<td class="py-1 pr-2"></td>' +
+          '<td class="py-1 text-slate-500 tabular-nums"></td>';
+        if (prev) prev.after(tr); else tbody.prepend(tr);
+      }
+      const [td0, td1, td2] = tr.children;
+      td0.textContent = field;
+      td1.innerHTML = '<span class="' + valClass(rec.value) + '">' + fmtVal(rec.value) + '</span>' +
+        (rec.unit ? ' <span class="text-slate-400">' + rec.unit + '</span>' : '');
+      td2.textContent = fmtAge(rec.age_s);
+      prev = tr;
+    }
+    applyFilter();
+  }
+
+  function applyFilter() {
+    const q = $('values-filter').value.trim().toLowerCase();
+    document.querySelectorAll('#values-tbody tr').forEach(tr => {
+      const match = !q || tr.dataset.field.toLowerCase().includes(q);
+      tr.classList.toggle('hidden', !match);
+    });
+  }
+
+  $('values-filter').addEventListener('input', applyFilter);
+
+  async function action(path) {
+    const btn = path === '/api/start' ? $('btn-start') : $('btn-stop');
+    btn.disabled = true;
+    try {
+      const r = await fetch(path, { method: 'POST' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+    } catch (e) {
+      console.error('action failed', path, e);
+      btn.disabled = false;
+    }
+    // SSE update will re-compute button state — no need to re-enable here.
+  }
+  $('btn-start').addEventListener('click', () => action('/api/start'));
+  $('btn-stop').addEventListener('click',  () => action('/api/stop'));
+
+  function connectSSE() {
+    const src = new EventSource('/events');
+    src.onopen = () => { $('sse-status').textContent = 'connected · live updates every 2s'; };
+    src.onmessage = e => {
+      try { update(JSON.parse(e.data)); }
+      catch (err) { console.error('SSE parse error', err); }
+    };
+    src.onerror = () => { $('sse-status').textContent = 'reconnecting…'; };
+  }
+
+  // Tick the age-display fields every second without needing a new SSE message.
+  setInterval(() => {
+    if (!lastSnap) return;
+    if (lastSnap.cycle_completed_ts) {
+      $('cycle-age').textContent =
+        fmtAge((Date.now() / 1000) - lastSnap.cycle_completed_ts);
+    }
+    if (lastSnap.last_screenshot_ts) {
+      $('screenshot-age').textContent =
+        fmtAge((Date.now() / 1000) - lastSnap.last_screenshot_ts);
+    }
+  }, 1000);
+
+  connectSSE();
+})();
+</script>
+</body>
+</html>"""
+
+
+STATIC_DIR = Path(__file__).parent / "static"
+SSE_INTERVAL_SECONDS = 2.0  # how often /events pushes a snapshot to connected clients
+
+
+def _snapshot_json(snap: dict) -> str:
+    """Serialize a Coordinator snapshot for SSE. ValueRecord instances are
+    flattened to plain dicts so the client JS doesn't need class shapes.
+    bool is serialized as JSON true/false so the UI can badge probe dots."""
+    values_out: dict[str, dict] = {}
+    for field, rec in snap["values"].items():
+        values_out[field] = {
+            "value": rec.value,
+            "ts_iso": rec.iso(),
+            "age_s": round(rec.age_s(), 1),
+            "unit": (SENSORS.get(field).unit if SENSORS.get(field) else None),
+        }
+    out = {k: v for k, v in snap.items() if k != "values"}
+    out["values"] = values_out
+    return json.dumps(out, default=str)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -1241,11 +1502,48 @@ class _HealthHandler(BaseHTTPRequestHandler):
         elif path == "/healthz":
             stale_after = SCRAPE_INTERVAL_SECONDS * 2 + 60
             age = time.time() - get_last_cycle()
-            ok = age < stale_after
+            # Healthz must not report unhealthy when the user has explicitly
+            # stopped the scraper — maintenance is an intended idle state,
+            # not a failure, so k8s probes should stay green.
+            ok = age < stale_after or COORD.is_maintenance()
             self._send(200 if ok else 503, "text/plain", f"age={age:.0f}s\n".encode())
         elif path in ("/", "/status"):
             html = render_status_html(COORD.snapshot())
             self._send(200, "text/html; charset=utf-8", html.encode("utf-8"))
+        elif path == "/events":
+            # Server-Sent Events stream. One persistent connection per client
+            # (ThreadingHTTPServer handles concurrency); yields a snapshot
+            # every SSE_INTERVAL_SECONDS. Client-side EventSource auto-reconnects
+            # on TCP drop, so we don't need retry logic on our side.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")  # disable nginx proxy buffering
+            self.end_headers()
+            try:
+                while True:
+                    payload = _snapshot_json(COORD.snapshot())
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    time.sleep(SSE_INTERVAL_SECONDS)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return  # client disconnected; just end the handler
+        elif path.startswith("/static/"):
+            # Serve vendored assets (tailwind.js etc). Strict path check keeps
+            # the server from reading outside the static/ directory.
+            rel = path[len("/static/"):]
+            if not rel or "/" in rel or rel.startswith(".") or ".." in rel:
+                self._send(400, "text/plain", b"bad path\n")
+                return
+            fpath = STATIC_DIR / rel
+            if not fpath.is_file():
+                self._send(404, "text/plain", b"not found\n")
+                return
+            ctype = "application/javascript" if rel.endswith(".js") else \
+                    "text/css" if rel.endswith(".css") else \
+                    "application/octet-stream"
+            self._send(200, ctype, fpath.read_bytes())
         elif path == "/screenshot.png":
             png = COORD.get_screenshot_png()
             if png is None:
@@ -1268,8 +1566,28 @@ class _HealthHandler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"not found\n")
 
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/api/stop":
+            COORD.set_maintenance(True)
+            event(logging.WARNING, "maintenance_on",
+                  "maintenance mode enabled via /api/stop")
+            self._send(200, "application/json",
+                       b'{"ok":true,"maintenance":true}')
+        elif path == "/api/start":
+            COORD.set_maintenance(False)
+            event(logging.INFO, "maintenance_off",
+                  "maintenance mode disabled via /api/start")
+            self._send(200, "application/json",
+                       b'{"ok":true,"maintenance":false}')
+        else:
+            self._send(404, "text/plain", b"not found\n")
+
 def start_http_server() -> None:
-    srv = HTTPServer(("0.0.0.0", METRICS_PORT), _HealthHandler)
+    # ThreadingHTTPServer is required now that /events holds a long-lived
+    # SSE stream per client — a single-threaded HTTPServer would block
+    # /metrics and /healthz behind any connected browser.
+    srv = ThreadingHTTPServer(("0.0.0.0", METRICS_PORT), _HealthHandler)
     threading.Thread(target=srv.serve_forever, daemon=True, name="http").start()
     event(logging.INFO, "http_started", "HTTP server listening", port=METRICS_PORT)
 
@@ -1595,6 +1913,13 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
     final_status = "error"
     final_error: Optional[str] = None
     try:
+        if COORD.is_maintenance():
+            event(logging.INFO, "maintenance", "scraper in maintenance mode (Stop button), skipping cycle")
+            m_runs.labels(status="maintenance").inc()
+            if broker and not dry_run:
+                broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "maintenance", retain=True)
+            final_status = "maintenance"
+            return CycleResult(status="maintenance", values={})
         if broker and broker.is_paused():
             event(logging.INFO, "paused", "scraper paused via MQTT toggle")
             m_runs.labels(status="paused").inc()
