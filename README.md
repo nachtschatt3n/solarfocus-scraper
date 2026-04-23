@@ -5,7 +5,7 @@
 
 Headless scraper for **Solarfocus pellet^top** biomass heaters. Drives the
 built-in VNC touchscreen, OCRs values with Tesseract (German lang pack),
-and publishes **36 sensors** to MQTT with **Home Assistant auto-discovery**.
+and publishes **46 sensors** to MQTT with **Home Assistant auto-discovery**.
 The heater has no Modbus TCP / public API, so this is the least-bad way to
 get live data into HA without swapping the controller.
 
@@ -25,6 +25,8 @@ and a `/healthz` suitable for k8s liveness/readiness probes.
 - **Betriebsstundenzähler p1 (7):** Saugzuggebläse, Lambdasonde, Wärmetauscherreinigung, Zündung, Einschub, Saugaustragung, Ascheaustragungsschnecke
 - **Betriebsstundenzähler p2 (5):** Pelletsbetrieb Teillast, Pelletsbetrieb, Kesselstarts, Betriebsstunden seit Wartung, Pelletsverbrauch (kg)
 - **Betriebsstundenzähler p3 / Wärmeverteilung (3):** RLA-Pumpe, OG Heizkreis, Fussbodenheizung
+- **Saugaustragung (4):** `saugaustragung_mode` (AUTO/MAN — classified from the green selection frame, not OCR), `einmalige_saugung` (Aus/Ein), `sondenumschaltung_mode` (e.g. `punktuell`), `info_leerer_sonden` (threshold for the empty-probe alert)
+- **Pellet probes (6):** `binary_sensor.solarfocus_pellet_heater_pellet_probe_1_full` … `_6_full` — one per pellet-storage zone. `on` = zone has pellets (green indicator on the heater UI), `off` = empty (red). Classified by R vs G channel sum over an 8×8 center crop of each probe square, so the read is insensitive to compression jitter and button highlight states.
 - **Controls (1):** `switch.solarfocus_pellet_heater_scraper_pause` — toggle from HA to pause VNC access when you want to use the touchscreen yourself
 - **Alerts (4):** `binary_sensor.solarfocus_pellet_heater_alert_active`, plus `sensor.*_alert_title`, `sensor.*_alert_body`, `sensor.*_alert_last_seen` — the heater pops modal alerts ("KESSELREINIGUNG EMPFOHLEN!", "Pellet Mangel", etc.) that must be dismissed with OK. The scraper detects them by hashing the info icon, OCRs the title+body, publishes to MQTT, and clicks OK. Works for any future info-type alert too.
 
@@ -42,7 +44,8 @@ The heater UI is modelled as a directed graph of screens. Each `Screen` has:
 
 ```
 main ──► auswahlmenue ──► kundenmenue ──► betriebsstunden_p1 ──► p2 ──► p3
-              │
+              │                │
+              │                └──► saugaustragung ──► automatische_saugsondenumschalteinheit
               ├──► kessel
               ├──► heizkreise_og ──► heizkreise_fbh
               └──► warmwasser

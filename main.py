@@ -37,6 +37,10 @@ from vncdotool import api as vnc_api
 # reads on the small UI font.
 FIELD_NUM = "--psm 7 -c tessedit_char_whitelist=0123456789.,-"
 FIELD_TEXT = "--psm 7"
+# Short single-word button captions ("Aus"/"Ein", "AUTO"/"MAN"). psm 8 prevents
+# tesseract from hallucinating trailing "B"/"." artifacts out of the button's
+# rounded-rectangle border, which psm 7 tokenizes as an extra word.
+FIELD_WORD = "--psm 8"
 # Multi-line German prose inside an alert modal — psm 6 treats the crop as
 # a block of text, keeping newlines in the OCR output.
 FIELD_PARAGRAPH = "--psm 6"
@@ -161,6 +165,29 @@ SCREENS: dict[str, Screen] = {
         back_xy=(45, 130),
         ocr_text="Fussbodenheizung",
     ),
+    # Pellet-auger config + schedule. Intermediate screen between kundenmenue
+    # and the probe-switching screen. The "Automatische Saugsondenumschalteinheit"
+    # button in the center is the forward edge to that screen. back_xy overrides
+    # the default (35,30) because these two screens have a dedicated title bar
+    # at y=0-28 and the back-arrow button sits below at y=55-95 — (35,30) would
+    # land in the dead grey area above the button.
+    "saugaustragung": Screen(
+        hash_region=(220, 2, 220, 28),  # "Saugaustragung" title
+        expected_hash="be352e08d3bdc222cd5adec10064cf0a347e3a40fc6aa9117bd43b1bb308e26c",
+        parent="kundenmenue",
+        back_xy=(45, 80),
+        ocr_text="Saugaustragung",
+    ),
+    # Pellet-storage probe overview. The 6 green/red squares at the bottom are
+    # the per-zone fill indicators read by probe_dot_state(); the rest of the
+    # screen has mode + threshold settings.
+    "automatische_saugsondenumschalteinheit": Screen(
+        hash_region=(85, 5, 470, 28),  # long "Automatische Saugsondenumschalteinheit" title
+        expected_hash="e788065b21e3c24810a7774b525c0fafb6e39831140d6ac08b5399f3ddbe5f5c",
+        parent="saugaustragung",
+        back_xy=(45, 80),
+        ocr_text="Saugsond",  # umlaut-free substring, tolerant of OCR on long title
+    ),
 }
 
 # Forward edges: tap (x, y) on `src` to land on `dst`.
@@ -174,6 +201,8 @@ EDGES: dict[tuple[str, str], tuple[int, int]] = {
     ("betriebsstunden_p1", "betriebsstunden_p2"): (575, 445),  # right arrow
     ("betriebsstunden_p2", "betriebsstunden_p3"): (575, 445),  # right arrow
     ("heizkreise_og",      "heizkreise_fbh"):     (565,  95),  # right arrow → next heat circuit
+    ("kundenmenue",        "saugaustragung"):     (250, 130),  # "Saugaustragung" button, top row middle
+    ("saugaustragung",     "automatische_saugsondenumschalteinheit"): (395, 333),  # full-width button under "Einmalige Saugung"
 }
 
 # Per field: which screen, where to crop, how to OCR, how to parse.
@@ -245,11 +274,39 @@ BBOXES: dict[str, FieldSpec] = {
     "fbh_mischerposition":       FieldSpec("heizkreise_fbh", (365, 378, 80, 22), FIELD_NUM,  "float"),
     "fbh_status_text":           FieldSpec("heizkreise_fbh", (130, 410, 360, 28), FIELD_TEXT, "str", invert=True),
     "fbh_heizkreis_status":      FieldSpec("heizkreise_fbh", ( 80, 445, 520, 22), FIELD_TEXT, "str", invert=True),
+    # Saugaustragung screen — AUTO/MAN mode is handled out of band in
+    # saugaustragung_mode() via color sampling of the green selection frame
+    # (both circle labels are always on-screen, so OCR alone can't distinguish).
+    "einmalige_saugung":         FieldSpec("saugaustragung", (410, 280, 85, 28), FIELD_WORD, "str", invert=True),
+    # Automatische Saugsondenumschalteinheit screen — probe dots are handled
+    # out of band in probe_dot_state() via PROBE_DOT_REGIONS.
+    "sondenumschaltung_mode":    FieldSpec("automatische_saugsondenumschalteinheit", (415, 115, 155, 28), FIELD_TEXT, "str", invert=True),
+    "info_leerer_sonden":        FieldSpec("automatische_saugsondenumschalteinheit", (330, 168,  55, 34), FIELD_NUM,  "int", invert=True),
 }
 
 # Fill-level bar interior (white when empty, dark when pellets present).
 FILL_BAR_REGION: Optional[tuple[int, int, int, int]] = (545, 175, 15, 150)
 FILL_BAR_FILLED_THRESHOLD = 200  # grayscale below this = filled pixel
+
+# 8x8 center crop of each of the 6 probe indicator squares on the
+# automatische_saugsondenumschalteinheit screen. Green=has pellets, red=empty.
+# Centers were found by column-scanning the bottom strip of a known-good
+# capture for saturated green/red pixels.
+PROBE_DOT_REGIONS: dict[int, tuple[int, int, int, int]] = {
+    1: (38, 436, 8, 8),
+    2: (91, 436, 8, 8),
+    3: (147, 436, 8, 8),
+    4: (202, 436, 8, 8),
+    5: (256, 436, 8, 8),
+    6: (312, 436, 8, 8),
+}
+
+# Pixels on the bright-green selection frame around each Saugaustragung
+# section. When AUTO is active the frame wraps the top (AUTO) section; when
+# MAN is active it wraps the bottom (MAN) section. We sample the left edge
+# of each potential frame — whichever is saturated green is the active mode.
+SAUGAUSTRAGUNG_AUTO_FRAME_XY = (15, 200)
+SAUGAUSTRAGUNG_MAN_FRAME_XY  = (15, 420)
 
 # Sanity bounds. Status_text excluded (string).
 SANITY_BOUNDS: dict[str, tuple[float, float]] = {
@@ -282,6 +339,7 @@ SANITY_BOUNDS: dict[str, tuple[float, float]] = {
     "fbh_vorlaufsolltemperatur":      (0, 90),
     "fbh_mischerposition":            (0, 100),
     "og_mischerposition":             (0, 100),
+    "info_leerer_sonden":             (0, 6),
 }
 
 # Counter fields whose values must never decrease vs. last published value.
@@ -398,6 +456,12 @@ SENSORS: dict[str, SensorMeta] = {
     "fbh_mischerposition":           SensorMeta("FBH Mischerposition", "%", None, "measurement"),
     "fbh_status_text":               SensorMeta("FBH Status"),
     "fbh_heizkreis_status":          SensorMeta("FBH Heizkreis"),
+    # Saugaustragung / probe-switching configuration (probe dots are
+    # binary_sensors, registered separately in publish_discovery)
+    "saugaustragung_mode":           SensorMeta("Saugaustragung Modus"),
+    "einmalige_saugung":             SensorMeta("Einmalige Saugung"),
+    "sondenumschaltung_mode":        SensorMeta("Sondenumschaltung"),
+    "info_leerer_sonden":            SensorMeta("Info-Schwelle leerer Sonden"),
 }
 
 # =============================================================================
@@ -573,6 +637,38 @@ def fill_level_percent(img: Image.Image) -> Optional[float]:
         return None
     filled = sum(1 for p in pixels if p < FILL_BAR_FILLED_THRESHOLD)
     return round(100.0 * filled / len(pixels), 1)
+
+def probe_dot_state(img: Image.Image, region: tuple[int, int, int, int]) -> Optional[bool]:
+    """True if dot is predominantly green (probe has pellets), False if red
+    (probe empty), None if neither channel clearly dominates — most likely a
+    miscalibrated bbox pointing at grey chrome. The 1.2x margin rejects
+    anti-aliased edges and grey borders without rejecting legitimate saturated
+    dots."""
+    rgb = crop(img, region).convert("RGB")
+    px = list(rgb.getdata())
+    r_sum = sum(p[0] for p in px)
+    g_sum = sum(p[1] for p in px)
+    if g_sum > r_sum * 1.2:
+        return True
+    if r_sum > g_sum * 1.2:
+        return False
+    return None
+
+def saugaustragung_mode(img: Image.Image) -> Optional[str]:
+    """Detect whether AUTO or MAN is the currently-selected mode on the
+    Saugaustragung screen. Both labelled circles are always visible, so OCR
+    can't tell which is active — but the UI draws a bright-green rectangle
+    around the selected section, so a single pixel sample on each frame's
+    left edge is enough to classify."""
+    rgb = img.convert("RGB")
+    def is_green(xy: tuple[int, int]) -> bool:
+        r, g, b = rgb.getpixel(xy)
+        return g > 150 and g > r + 60 and g > b + 60
+    if is_green(SAUGAUSTRAGUNG_AUTO_FRAME_XY):
+        return "AUTO"
+    if is_green(SAUGAUSTRAGUNG_MAN_FRAME_XY):
+        return "MAN"
+    return None
 
 # =============================================================================
 # Template-matching OCR (deterministic, CPU-independent)
@@ -837,6 +933,22 @@ def publish_discovery(broker: MqttBroker) -> None:
         "device_class": "timestamp",
         "device": DEVICE_BLOCK,
     }, retain=True)
+
+    # Per-probe fill indicators. on=green (has pellets), off=red (empty).
+    # device_class is deliberately omitted — these aren't "problems" in the HA
+    # sense (any single empty probe is normal during a suck cycle), and the
+    # count of empty probes crossing info_leerer_sonden is the alertable signal.
+    for i in PROBE_DOT_REGIONS:
+        field = f"pellet_probe_{i}_full"
+        broker.publish(f"{MQTT_DISCOVERY_PREFIX}/binary_sensor/{MQTT_DEVICE_ID}/{field}/config", {
+            "name": f"Pellet Probe {i}",
+            "unique_id": f"{MQTT_DEVICE_ID}_{field}",
+            "object_id": f"{MQTT_DEVICE_ID}_{field}",
+            "state_topic": f"{MQTT_TOPIC_PREFIX}/{field}",
+            "payload_on": "on",
+            "payload_off": "off",
+            "device": DEVICE_BLOCK,
+        }, retain=True)
 
 # =============================================================================
 # Coordinator — single owner of state machine + cycle exclusion
@@ -1345,6 +1457,13 @@ def _ocr_all(img_by_screen: dict[str, Image.Image]) -> dict[str, object]:
         main_img = img_by_screen.get("main")
         if main_img is not None:
             out["fill_level_percent"] = fill_level_percent(main_img)
+    saug_img = img_by_screen.get("saugaustragung")
+    if saug_img is not None:
+        out["saugaustragung_mode"] = saugaustragung_mode(saug_img)
+    probe_img = img_by_screen.get("automatische_saugsondenumschalteinheit")
+    if probe_img is not None:
+        for i, region in PROBE_DOT_REGIONS.items():
+            out[f"pellet_probe_{i}_full"] = probe_dot_state(probe_img, region)
     return out
 
 def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
@@ -1402,6 +1521,12 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
     rejected: dict[str, str] = {}
     for field, val in values.items():
         if val is None:
+            continue
+        # Skip numeric checks for bool values (isinstance(True, int) is True
+        # in Python, so without this guard a probe's True/False would collide
+        # with any future SANITY_BOUNDS/COUNTER_FIELDS/MAX_DELTA entry on the
+        # same field name).
+        if isinstance(val, bool):
             continue
         bounds = SANITY_BOUNDS.get(field)
         if bounds and isinstance(val, (int, float)):
@@ -1587,11 +1712,19 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                 publish_discovery(broker)
                 first_run_ref[0] = False
             for field, val in accepted.items():
+                # bool MUST come before str() — isinstance(True, int) is True in
+                # Python, and "True"/"False" is not what HA's binary_sensor
+                # discovery expects; it'd leave the entity as "unavailable"
+                # until someone publishes "on"/"off".
+                if isinstance(val, bool):
+                    payload = "on" if val else "off"
+                else:
+                    payload = str(val)
                 # Retain sensor values so HA recovers state on restart and the
                 # delta check in _sanity_check has a stable baseline after a
                 # pod restart. Non-retained publishes were dropping HA entities
                 # to "unknown" after every HA reload.
-                broker.publish(f"{MQTT_TOPIC_PREFIX}/{field}", str(val), retain=True)
+                broker.publish(f"{MQTT_TOPIC_PREFIX}/{field}", payload, retain=True)
                 event(logging.DEBUG, "mqtt_published", "value published", field=field, value=val)
             status = "partial" if rejected else "ok"
             broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", status, retain=True)
