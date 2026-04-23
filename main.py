@@ -1036,6 +1036,14 @@ class Coordinator:
         with self.state_lock:
             self.target_screen = target
 
+    def set_current_screen(self, screen: Optional[str]) -> None:
+        """Lightweight update of the current-screen pointer without capturing
+        a new PNG. Used after the post-cycle return-to-main navigation so the
+        status page reflects the heater's actual parked state, not just the
+        last OCR'd page."""
+        with self.state_lock:
+            self.current_screen = screen
+
     def update_after_capture(self, screen: Optional[str], img: Image.Image) -> None:
         buf = BytesIO()
         img.save(buf, format="PNG")
@@ -1081,6 +1089,10 @@ class Coordinator:
                 "last_screenshot_ts": self.last_screenshot_ts,
                 "last_screenshot_screen": self.last_screenshot_screen,
                 "maintenance_mode": self.maintenance_mode,
+                # Per-screen last-capture timestamp for the status page's
+                # Screens table — drops the PNG bytes, keeps only the ts.
+                "per_screen_ts": {name: ts for name, (_png, ts)
+                                  in self.per_screen_captures.items()},
                 "values": dict(self.values),  # shallow copy is fine; ValueRecord is immutable enough
             }
 
@@ -1137,7 +1149,8 @@ def render_status_html(snap: dict) -> str:
             f'<td class="py-1 pr-2 font-mono">{html_escape(name)}</td>'
             f'<td class="py-1 pr-2 text-slate-600">{html_escape(s.parent or "—")}</td>'
             f'<td class="py-1 pr-2">{cal}</td>'
-            f'<td class="py-1 text-slate-600">{bbox_count}</td></tr>'
+            f'<td class="py-1 pr-2 text-slate-600">{bbox_count}</td>'
+            f'<td class="py-1 text-slate-500 tabular-nums" data-last-scraped>—</td></tr>'
         )
     screens_tbody = "".join(screen_rows_parts)
 
@@ -1253,7 +1266,8 @@ _STATUS_HTML_TEMPLATE = """<!doctype html>
         <th class="text-left py-1 pr-2 font-semibold text-slate-600">name</th>
         <th class="text-left py-1 pr-2 font-semibold text-slate-600">parent</th>
         <th class="text-left py-1 pr-2 font-semibold text-slate-600">calibrated</th>
-        <th class="text-left py-1 font-semibold text-slate-600">bboxes</th>
+        <th class="text-left py-1 pr-2 font-semibold text-slate-600">bboxes</th>
+        <th class="text-left py-1 font-semibold text-slate-600">last scraped</th>
       </tr>
     </thead>
     <tbody id="screens-tbody">__SCREENS_TBODY__</tbody>
@@ -1369,11 +1383,20 @@ _STATUS_HTML_TEMPLATE = """<!doctype html>
         fmtAge((Date.now() / 1000) - snap.last_screenshot_ts);
     }
 
-    // Highlight current screen row in the screens table
+    // Highlight current screen row + stamp per-screen last-scrape age
+    const nowS = Date.now() / 1000;
+    const perTs = snap.per_screen_ts || {};
     document.querySelectorAll('tr[data-screen]').forEach(tr => {
-      const isCurrent = tr.dataset.screen === snap.current_screen;
+      const name = tr.dataset.screen;
+      const isCurrent = name === snap.current_screen;
       tr.classList.toggle('bg-sky-50', isCurrent);
       tr.classList.toggle('font-semibold', isCurrent);
+      const cell = tr.querySelector('[data-last-scraped]');
+      if (cell) {
+        const ts = perTs[name];
+        cell.textContent = ts ? fmtAge(nowS - ts) + ' ago' : '—';
+        cell.title = ts ? new Date(ts * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : '';
+      }
     });
 
     // Values table: diff-patch in place so scroll position is kept
@@ -1446,14 +1469,20 @@ _STATUS_HTML_TEMPLATE = """<!doctype html>
   // Tick the age-display fields every second without needing a new SSE message.
   setInterval(() => {
     if (!lastSnap) return;
+    const nowS = Date.now() / 1000;
     if (lastSnap.cycle_completed_ts) {
-      $('cycle-age').textContent =
-        fmtAge((Date.now() / 1000) - lastSnap.cycle_completed_ts);
+      $('cycle-age').textContent = fmtAge(nowS - lastSnap.cycle_completed_ts);
     }
     if (lastSnap.last_screenshot_ts) {
-      $('screenshot-age').textContent =
-        fmtAge((Date.now() / 1000) - lastSnap.last_screenshot_ts);
+      $('screenshot-age').textContent = fmtAge(nowS - lastSnap.last_screenshot_ts);
     }
+    const perTs = lastSnap.per_screen_ts || {};
+    document.querySelectorAll('tr[data-screen]').forEach(tr => {
+      const cell = tr.querySelector('[data-last-scraped]');
+      if (!cell) return;
+      const ts = perTs[tr.dataset.screen];
+      if (ts) cell.textContent = fmtAge(nowS - ts) + ' ago';
+    });
   }, 1000);
 
   connectSSE();
@@ -1609,6 +1638,14 @@ class _NavFail(Exception):
     def __init__(self, screen: str):
         self.screen = screen
         super().__init__(f"could not reach {screen}")
+
+
+class _MaintenanceAbort(Exception):
+    """Raised mid-cycle when the user hits Stop on the status page. The outer
+    try/finally in run_cycle disconnects VNC immediately, freeing the single
+    VNC slot for the user's manual session — the whole point of the Stop
+    button is "I need the heater touchscreen now, don't make me wait 30s for
+    this cycle to finish."""
 
 def _identify_screen(img: Image.Image) -> Optional[str]:
     """Return the name of the matching known screen, or None.
@@ -1956,6 +1993,12 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                 """Navigate each needed screen, capture, OCR everything, record in COORD."""
                 img_by_screen: dict[str, Image.Image] = {}
                 for screen_name in screens_needed:
+                    # Check the Stop button between every screen — the user's
+                    # manual VNC session is blocked as long as this cycle holds
+                    # the single VNC slot, so bail out at the next safe seam
+                    # rather than finishing all 8 screens.
+                    if COORD.is_maintenance():
+                        raise _MaintenanceAbort()
                     COORD.set_phase("navigating", detail=f"→ {screen_name}")
                     COORD.set_target(screen_name)
                     if not navigate_to(client, screen_name):
@@ -1986,6 +2029,14 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                 final_status = "navigation_failed"
                 final_error = f"could not reach {nf.screen}"
                 return _handle_nav_fail(client, broker, dry_run, nf.screen)
+            except _MaintenanceAbort:
+                event(logging.INFO, "maintenance_abort",
+                      "cycle aborted mid-flight by Stop button, releasing VNC")
+                m_runs.labels(status="maintenance").inc()
+                if broker and not dry_run:
+                    broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "maintenance", retain=True)
+                final_status = "maintenance"
+                return CycleResult(status="maintenance", values={})
 
             # First sanity pass. If any field trips, re-capture + re-OCR
             # everything once — the heater's UI occasionally redraws mid-frame
@@ -2004,9 +2055,31 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                     final_status = "navigation_failed"
                     final_error = f"could not reach {nf.screen} (on retry)"
                     return _handle_nav_fail(client, broker, dry_run, nf.screen)
+                except _MaintenanceAbort:
+                    event(logging.INFO, "maintenance_abort",
+                          "cycle aborted mid-retry by Stop button, releasing VNC")
+                    m_runs.labels(status="maintenance").inc()
+                    if broker and not dry_run:
+                        broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "maintenance", retain=True)
+                    final_status = "maintenance"
+                    return CycleResult(status="maintenance", values={})
                 values = values_retry
                 rejected = _sanity_check(values, broker, allow_delta_override=True)
         finally:
+            # Best-effort: park the heater on the main screen so (a) the next
+            # cycle always starts from a known state, and (b) when the user
+            # walks up to the physical touchscreen they see the overview
+            # rather than whatever sub-page we happened to OCR last. Skip
+            # when maintenance was just triggered — the whole point of Stop
+            # is to release VNC *now*, not click a few more times first.
+            if not COORD.is_maintenance():
+                try:
+                    if navigate_to(client, "main", max_steps=6):
+                        COORD.set_current_screen("main")
+                except Exception as e:
+                    event(logging.DEBUG, "return_to_main_failed",
+                          "best-effort return to main failed",
+                          error=str(e))
             try:
                 client.disconnect()
             except Exception:
