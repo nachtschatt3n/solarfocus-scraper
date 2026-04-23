@@ -223,9 +223,16 @@ class FieldSpec:
 
 BBOXES: dict[str, FieldSpec] = {
     # main screen
-    "kesseltemperatur":     FieldSpec("main", (260, 388, 100, 22), FIELD_NUM,  "float"),
-    "restsauerstoffgehalt": FieldSpec("main", (260, 415, 100, 22), FIELD_NUM,  "float"),
-    "outside_temperature":  FieldSpec("main", (560,  40,  35, 25), FIELD_NUM,  "float"),
+    # Bboxes on the three numeric fields were very sensitive to Tesseract's
+    # 2x-upscale segmentation — a 2px shift + 5px width trim made the
+    # difference between "69" and a spurious "869" read on kesseltemperatur,
+    # between "21.0" and "21.0." on restsauerstoffgehalt (the trailing dot
+    # poisoned parse_value), and between "9" and an empty read on
+    # outside_temperature (whose tight 35x25 window left no padding for
+    # Tesseract's LSTM to seed from). All three were retuned 2026-04-24.
+    "kesseltemperatur":     FieldSpec("main", (258, 386,  95, 24), FIELD_NUM,  "float"),
+    "restsauerstoffgehalt": FieldSpec("main", (258, 414,  95, 24), FIELD_NUM,  "float"),
+    "outside_temperature":  FieldSpec("main", (550,  35,  60, 40), FIELD_NUM,  "float"),
     "status_text":          FieldSpec("main", (160, 448, 320, 28), FIELD_TEXT, "str", invert=True),
     # Betriebsstundenzähler page 1 (rows step ~35px starting at y=84)
     "saugzuggeblaese_h":          FieldSpec("betriebsstunden_p1", (430,  84, 100, 22), FIELD_NUM, "float"),
