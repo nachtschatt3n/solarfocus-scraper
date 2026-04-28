@@ -251,7 +251,10 @@ BBOXES: dict[str, FieldSpec] = {
     # Kessel screen
     "puffer_temp_top":     FieldSpec("kessel", (335, 152,  90, 25), FIELD_NUM,  "float"),
     "puffer_temp_bottom":  FieldSpec("kessel", (320, 320,  75, 30), FIELD_NUM,  "float"),
-    "kessel_status_text":  FieldSpec("kessel", (100, 398, 440, 30), FIELD_TEXT, "str", invert=True),
+    # Bbox retuned 2026-04-28: the dark-on-grey "Keine Anforderung an Kessel"
+    # row sits at y=412-426; the old (100, 398, 440, 30) only grazed the top
+    # half of the glyphs, producing OCR like "Keine AÄnforderuna an Kessel".
+    "kessel_status_text":  FieldSpec("kessel", ( 60, 408, 540, 30), FIELD_TEXT, "str", invert=True),
     # Heizkreis OG screen
     # Y range covers both heat-circuit layouts: 4-row "Heizbetrieb" (value at
     # y≈325) and 3-row "Absenkbetrieb" where the Vorlaufsolltemperatur row is
@@ -276,7 +279,10 @@ BBOXES: dict[str, FieldSpec] = {
     "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float", engine="template"),
     "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float", engine="template"),
     # Heizkreis Fussbodenheizung (live floor-heating circuit) — rows ~5px higher than OG
-    "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (365, 320, 80, 22), FIELD_NUM,  "float"),
+    # Bbox retuned 2026-04-28: the digit row sits ~3-5px lower than the
+    # old bbox covered, and Tesseract needed a few extra px of margin to
+    # segment cleanly. Old (365, 320, 80, 22) returned None on every read.
+    "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (360, 322, 90, 30), FIELD_NUM,  "float"),
     "fbh_vorlaufsolltemperatur": FieldSpec("heizkreise_fbh", (365, 350, 80, 24), FIELD_NUM,  "float"),
     "fbh_mischerposition":       FieldSpec("heizkreise_fbh", (365, 378, 80, 22), FIELD_NUM,  "float"),
     "fbh_status_text":           FieldSpec("heizkreise_fbh", (130, 410, 360, 28), FIELD_TEXT, "str", invert=True),
@@ -284,7 +290,10 @@ BBOXES: dict[str, FieldSpec] = {
     # Saugaustragung screen — AUTO/MAN mode is handled out of band in
     # saugaustragung_mode() via color sampling of the green selection frame
     # (both circle labels are always on-screen, so OCR alone can't distinguish).
-    "einmalige_saugung":         FieldSpec("saugaustragung", (410, 280, 85, 28), FIELD_WORD, "str", invert=True),
+    # Bbox retuned 2026-04-28: tighter window over the "Aus"/"Ein" toggle
+    # button cures the leading-"g"/trailing-"." artifact that the wider
+    # (410, 280, 85, 28) was producing.
+    "einmalige_saugung":         FieldSpec("saugaustragung", (425, 282, 60, 22), FIELD_WORD, "str", invert=True),
     # Automatische Saugsondenumschalteinheit screen — probe dots are handled
     # out of band in probe_dot_state() via PROBE_DOT_REGIONS.
     "sondenumschaltung_mode":    FieldSpec("automatische_saugsondenumschalteinheit", (415, 115, 155, 28), FIELD_TEXT, "str", invert=True),
@@ -333,7 +342,11 @@ SANITY_BOUNDS: dict[str, tuple[float, float]] = {
     "anzahl_kesselstarts":            (0, 1_000_000),
     "betriebsstunden_seit_wartung_h": (0, 1_000_000),
     "pelletsverbrauch_kg":            (0, 10_000_000),
-    "puffer_temp_top":                (-10, 120),
+    # Lower bound 10 (not -10) keeps OCR misreads where Tesseract drops
+    # the leading digit of a 2-digit value ("44" → "4") from sneaking past
+    # the delta_override breaker. Buffer tanks don't run below ~10°C in
+    # any reasonable operating state — anything lower is OCR error.
+    "puffer_temp_top":                ( 10, 120),
     "puffer_temp_bottom":             (-10, 120),
     "og_vorlauftemperatur":           (0, 90),
     "og_vorlaufsolltemperatur":       (0, 90),
