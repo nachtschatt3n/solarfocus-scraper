@@ -279,10 +279,13 @@ BBOXES: dict[str, FieldSpec] = {
     "og_h":                FieldSpec("betriebsstunden_p3", (410, 135, 140, 28), FIELD_NUM, "float", engine="template"),
     "fussbodenheizung_h":  FieldSpec("betriebsstunden_p3", (410, 165, 140, 28), FIELD_NUM, "float", engine="template"),
     # Heizkreis Fussbodenheizung (live floor-heating circuit) — rows ~5px higher than OG
-    # Bbox retuned 2026-04-28: the digit row sits ~3-5px lower than the
-    # old bbox covered, and Tesseract needed a few extra px of margin to
-    # segment cleanly. Old (365, 320, 80, 22) returned None on every read.
-    "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (360, 322, 90, 30), FIELD_NUM,  "float"),
+    # Bbox retuned twice on 2026-04-28: the original (365, 320, 80, 22)
+    # was returning None on every read; (360, 322, 90, 30) read "1" instead
+    # of "31" because the 90-px width truncated the leading digit on the
+    # production capture. (355, 320, 110, 30) is wide enough to reliably
+    # catch both digits and verifies cleanly against captures showing
+    # values 31 and 33.
+    "fbh_vorlauftemperatur":     FieldSpec("heizkreise_fbh", (355, 320, 110, 30), FIELD_NUM,  "float"),
     "fbh_vorlaufsolltemperatur": FieldSpec("heizkreise_fbh", (365, 350, 80, 24), FIELD_NUM,  "float"),
     "fbh_mischerposition":       FieldSpec("heizkreise_fbh", (365, 378, 80, 22), FIELD_NUM,  "float"),
     "fbh_status_text":           FieldSpec("heizkreise_fbh", (130, 410, 360, 28), FIELD_TEXT, "str", invert=True),
