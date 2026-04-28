@@ -410,6 +410,15 @@ MAX_DELTA_PER_CYCLE: dict[str, float] = {
 _DELTA_CONFIRM: dict[str, tuple[float, int]] = {}
 DELTA_CONFIRM_THRESHOLD = 3
 
+# Same idea but for the counter monotonicity guard. Without this breaker, a
+# single OCR-inflated read that gets retained as the new baseline pins the
+# counter forever — every subsequent (correct, lower) read trips "decreased
+# from", with no path back. With this, three consecutive same-ish lower reads
+# override the inflated baseline. Tolerance is generous because hour counters
+# tick by ≤0.1/cycle so consecutive correct reads agree to within ~1.
+_DECREASE_CONFIRM: dict[str, tuple[float, int]] = {}
+DECREASE_CONFIRM_TOLERANCE = 1.0
+
 # Home Assistant discovery metadata per field.
 @dataclass
 class SensorMeta:
@@ -1871,11 +1880,16 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
       3. Delta check (MAX_DELTA_PER_CYCLE) — plausible change between cycles.
          Skipped when no prior value is known.
 
-    `allow_delta_override=True` enables the deadlock-breaker: persistent
-    out-of-delta reads get counted in _DELTA_CONFIRM, and once a field's same
-    out-of-delta value has been seen DELTA_CONFIRM_THRESHOLD cycles in a row,
-    the reject is flipped to accept. Only set True on the retry pass of
-    run_cycle so we count once per cycle, not once per sanity call.
+    `allow_delta_override=True` enables the deadlock-breaker on TWO paths:
+      - Delta-exceed: persistent out-of-delta reads get counted in
+        _DELTA_CONFIRM and accepted after DELTA_CONFIRM_THRESHOLD matching
+        cycles.
+      - Counter-decreased: persistent below-baseline reads get counted in
+        _DECREASE_CONFIRM and accepted on the same threshold. This recovers
+        from OCR-inflated retained baselines that would otherwise pin the
+        counter forever (the monotonicity guard refuses any lower value).
+    Only set True on the retry pass of run_cycle so we count once per cycle,
+    not once per sanity call.
 
     Every field is checked in one pass; run_cycle publishes the accepted
     fields and holds back only the rejected ones.
@@ -1902,8 +1916,35 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
                 try:
                     prev = float(prev_str)
                     if val < prev:
-                        rejected[field] = f"{val} decreased from {prev}"
+                        # Same N-confirmation breaker as MAX_DELTA_PER_CYCLE.
+                        # Catches OCR-inflated retained baselines that have
+                        # locked the counter at an unreachably-high value:
+                        # if the field reads consistently lower for N cycles,
+                        # the inflated baseline is wrong and the new value
+                        # should be accepted as truth.
+                        if allow_delta_override:
+                            tracked = _DECREASE_CONFIRM.get(field)
+                            if tracked and abs(val - tracked[0]) <= DECREASE_CONFIRM_TOLERANCE:
+                                count = tracked[1] + 1
+                            else:
+                                count = 1
+                            if count >= DELTA_CONFIRM_THRESHOLD:
+                                event(logging.WARNING, "decrease_override_accepted",
+                                      "accepting decreased counter after persistent confirmation",
+                                      field=field, value=val, prev=prev,
+                                      confirmations=count)
+                                _DECREASE_CONFIRM.pop(field, None)
+                                continue
+                            _DECREASE_CONFIRM[field] = (val, count)
+                            rejected[field] = (
+                                f"{val} decreased from {prev} "
+                                f"(confirm {count}/{DELTA_CONFIRM_THRESHOLD})")
+                        else:
+                            rejected[field] = f"{val} decreased from {prev}"
                         continue
+                    elif allow_delta_override:
+                        # No longer decreasing — clear the tracker.
+                        _DECREASE_CONFIRM.pop(field, None)
                 except ValueError:
                     pass
         max_delta = MAX_DELTA_PER_CYCLE.get(field)
