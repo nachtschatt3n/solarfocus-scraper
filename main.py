@@ -293,10 +293,11 @@ BBOXES: dict[str, FieldSpec] = {
     # Saugaustragung screen — AUTO/MAN mode is handled out of band in
     # saugaustragung_mode() via color sampling of the green selection frame
     # (both circle labels are always on-screen, so OCR alone can't distinguish).
-    # Bbox retuned 2026-04-28: tighter window over the "Aus"/"Ein" toggle
-    # button cures the leading-"g"/trailing-"." artifact that the wider
-    # (410, 280, 85, 28) was producing.
-    "einmalige_saugung":         FieldSpec("saugaustragung", (425, 282, 60, 22), FIELD_WORD, "str", invert=True),
+    # Bbox retuned 2026-04-29: production was reading "US," — the leading
+    # "A" was getting truncated by PSM 8 (single-word mode) on a tight bbox.
+    # Wider window (420, 280, 65, 26) + PSM 7 (line mode) gives Tesseract
+    # enough horizontal context to find the baseline and reads "Aus" cleanly.
+    "einmalige_saugung":         FieldSpec("saugaustragung", (420, 280, 65, 26), FIELD_TEXT, "str", invert=True),
     # Automatische Saugsondenumschalteinheit screen — probe dots are handled
     # out of band in probe_dot_state() via PROBE_DOT_REGIONS.
     "sondenumschaltung_mode":    FieldSpec("automatische_saugsondenumschalteinheit", (415, 115, 155, 28), FIELD_TEXT, "str", invert=True),
