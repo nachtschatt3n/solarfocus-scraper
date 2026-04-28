@@ -1526,6 +1526,12 @@ _STATUS_HTML_TEMPLATE = """<!doctype html>
 
 STATIC_DIR = Path(__file__).parent / "static"
 SSE_INTERVAL_SECONDS = 2.0  # how often /events pushes a snapshot to connected clients
+# Each /events connection runs in its own ThreadingHTTPServer thread, and any
+# per-connection state (twisted/jsonlogger artifacts, thread stacks, leaked
+# refs) only frees on handler return. Capping connection lifetime bounds the
+# memory we can leak per session — the browser's EventSource auto-reconnects
+# in ~3s when we close, so the cycle is invisible to the user.
+SSE_MAX_CONNECTION_SECONDS = 300.0
 
 
 def _snapshot_json(snap: dict) -> str:
@@ -1575,21 +1581,25 @@ class _HealthHandler(BaseHTTPRequestHandler):
             # Server-Sent Events stream. One persistent connection per client
             # (ThreadingHTTPServer handles concurrency); yields a snapshot
             # every SSE_INTERVAL_SECONDS. Client-side EventSource auto-reconnects
-            # on TCP drop, so we don't need retry logic on our side.
+            # on TCP drop, so we don't need retry logic on our side. We also
+            # close the connection after SSE_MAX_CONNECTION_SECONDS to bound
+            # per-connection memory growth from any leaked thread state.
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.send_header("X-Accel-Buffering", "no")  # disable nginx proxy buffering
             self.end_headers()
+            deadline = time.monotonic() + SSE_MAX_CONNECTION_SECONDS
             try:
-                while True:
+                while time.monotonic() < deadline:
                     payload = _snapshot_json(COORD.snapshot())
                     self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
                     time.sleep(SSE_INTERVAL_SECONDS)
             except (BrokenPipeError, ConnectionResetError, OSError):
-                return  # client disconnected; just end the handler
+                pass  # client disconnected; just end the handler
+            return  # graceful timeout — browser EventSource will reconnect
         elif path.startswith("/static/"):
             # Serve vendored assets (tailwind.js etc). Strict path check keeps
             # the server from reading outside the static/ directory.
