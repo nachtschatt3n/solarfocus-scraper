@@ -384,13 +384,18 @@ MAX_DELTA_PER_CYCLE: dict[str, float] = {
     "kesseltemperatur":            25.0,   # °C — can ramp fast when burner ignites
     "outside_temperature":          8.0,   # °C
     "puffer_temp_top":             25.0,   # °C — top of buffer heats fast under active charging
-    "puffer_temp_bottom":          20.0,   # °C
+    "puffer_temp_bottom":          40.0,   # °C — widened 2026-04-30: full boiler-ignition cycle pushes
+                                            # bottom-of-tank from ~30 to ~70 in a single 5-min interval,
+                                            # so the prior 20 °C cap was rejecting legitimate ramps.
+                                            # Sanity-bounds (-10, 120) still catch impossible values.
     "restsauerstoffgehalt":         5.0,   # %
     "fill_level_percent":           5.0,   # % — pellet auger delivers in steps
     "og_vorlauftemperatur":         8.0,   # °C
     "og_vorlaufsolltemperatur":    20.0,   # °C — setpoint can jump on schedule
     "og_mischerposition":          30.0,   # %  — mixer can slam open/shut
-    "fbh_vorlauftemperatur":        8.0,
+    "fbh_vorlauftemperatur":       15.0,   # widened 2026-04-30: FBH ramp during heating exceeds 8 °C
+                                            # cap regularly (real swings ~10-12 °C/cycle); 15 leaves
+                                            # margin without admitting impossible reads.
     "fbh_vorlaufsolltemperatur":   20.0,
     "fbh_mischerposition":         30.0,
     "ww_ist_temp":                  8.0,
