@@ -389,7 +389,12 @@ MAX_DELTA_PER_CYCLE: dict[str, float] = {
                                             # so the prior 20 °C cap was rejecting legitimate ramps.
                                             # Sanity-bounds (-10, 120) still catch impossible values.
     "restsauerstoffgehalt":         5.0,   # %
-    "fill_level_percent":           5.0,   # % — pellet auger delivers in steps
+    # NOTE: fill_level_percent intentionally NOT delta-checked. This field
+    # is the burner's internal pellet hopper, refilled in bursts by the
+    # Saugaustragung suction system pulling from the main storage silo —
+    # so it legitimately cycles 0 → 100% in minutes when a suction kicks
+    # in. The static SANITY_BOUNDS (0, 100) are sufficient sanity; any
+    # delta cap would chronically reject the normal volatility.
     "og_vorlauftemperatur":         8.0,   # °C
     "og_vorlaufsolltemperatur":    20.0,   # °C — setpoint can jump on schedule
     "og_mischerposition":          30.0,   # %  — mixer can slam open/shut
