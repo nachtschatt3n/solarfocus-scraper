@@ -459,7 +459,10 @@ SENSORS: dict[str, SensorMeta] = {
     "kesseltemperatur":     SensorMeta("Kesseltemperatur", "°C", "temperature", "measurement"),
     "restsauerstoffgehalt": SensorMeta("Restsauerstoffgehalt", "%", None, "measurement"),
     "status_text":          SensorMeta("Status"),
-    "fill_level_percent":   SensorMeta("Pellets Füllstand", "%", None, "measurement"),
+    # "Brenner Füllstand" (was "Pellets Füllstand") — this is the burner's
+    # internal hopper that the Saugaustragung suction system tops up; not the
+    # silo level. The new name disambiguates it from the storage tank.
+    "fill_level_percent":   SensorMeta("Brenner Füllstand", "%", None, "measurement"),
     "outside_temperature":  SensorMeta("Außentemperatur", "°C", "temperature", "measurement"),
     # Betriebsstundenzähler page 1
     "saugzuggeblaese_h":             SensorMeta("Saugzuggebläse", "h", "duration", "total_increasing"),
