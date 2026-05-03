@@ -945,6 +945,21 @@ def publish_discovery(broker: MqttBroker) -> None:
         "device": DEVICE_BLOCK,
     }, retain=True)
 
+    # Last-run timestamp. The scraper publishes a fresh tz-aware ISO8601 string
+    # to scraper/last_run after every successful cycle. HA's MQTT integration
+    # silently drops state-equal updates (no last_changed bump), which is why
+    # binding a "last run" tile to scraper_status.last_changed shows a stale
+    # time across long stretches of `ok`. This separate timestamp entity
+    # always changes, so HA always records the new value.
+    broker.publish(f"{MQTT_DISCOVERY_PREFIX}/sensor/{MQTT_DEVICE_ID}/scraper_last_run/config", {
+        "name": "Scraper Last Run",
+        "unique_id": f"{MQTT_DEVICE_ID}_scraper_last_run",
+        "object_id": f"{MQTT_DEVICE_ID}_scraper_last_run",
+        "state_topic": f"{MQTT_TOPIC_PREFIX}/scraper/last_run",
+        "device_class": "timestamp",
+        "device": DEVICE_BLOCK,
+    }, retain=True)
+
     # Alert entities — binary_sensor for active flag, text sensors for the
     # most recent title + body (retained, so they survive a scraper restart).
     broker.publish(f"{MQTT_DISCOVERY_PREFIX}/binary_sensor/{MQTT_DEVICE_ID}/alert_active/config", {
@@ -1397,10 +1412,15 @@ _STATUS_HTML_TEMPLATE = """<!doctype html>
     sb.className = 'inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ' +
                    (STATUS_STYLES[s] || 'bg-slate-100 text-slate-600');
 
-    // Cycle stats
+    // Cycle stats — render in the browser's local TZ. toISOString() returns UTC,
+    // which is misleading for a user who reads the timestamp at a glance and
+    // compares it with HA / the wall clock. Build the local-time string by hand.
     if (snap.cycle_completed_ts) {
+      const d = new Date(snap.cycle_completed_ts * 1000);
+      const p = (n) => String(n).padStart(2, '0');
       $('cycle-iso').textContent =
-        new Date(snap.cycle_completed_ts * 1000).toISOString().slice(0, 19).replace('T', ' ');
+        `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ` +
+        `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
     }
     $('cycle-age').textContent = snap.cycle_completed_ts
       ? fmtAge((Date.now() / 1000) - snap.cycle_completed_ts) : '—';
