@@ -135,7 +135,7 @@ template:
             'binary_sensor.solarfocus_pellet_heater_pellet_probe_5',
             'binary_sensor.solarfocus_pellet_heater_pellet_probe_6',
           ] %}
-          {{ ids | map('states') | rejectattr('==', 'on') | list | count }}
+          {{ ids | map('states') | reject('eq', 'on') | list | count }}
 
 # ---------------------------------------------------------------------------
 # 4) Two-stage alert: WARN at >=4 empty (matches the heater's
