@@ -12,10 +12,10 @@
 # into a Lovelace view via Edit Dashboard → Raw configuration.
 #
 # Source data published by the solarfocus-scraper:
-#   sensor.solarfocus_pellet_heater_pelletsverbrauch_kg
+#   sensor.solarfocus_pellet_heater_pelletsverbrauch
 #       cumulative kg, monotonically increasing
-#   binary_sensor.solarfocus_pellet_heater_pellet_probe_1_full
-#       ... through _6_full — on=full, off=empty (one per silo probe)
+#   binary_sensor.solarfocus_pellet_heater_pellet_probe_1
+#       ... through _6 — on=full, off=empty (one per silo probe)
 
 # ---------------------------------------------------------------------------
 # 1) Actual consumption per period (auto-resets at each cycle boundary)
@@ -24,23 +24,23 @@
 utility_meter:
   pellet_consumption_hourly:
     name: Pellet consumption (current hour)
-    source: sensor.solarfocus_pellet_heater_pelletsverbrauch_kg
+    source: sensor.solarfocus_pellet_heater_pelletsverbrauch
     cycle: hourly
   pellet_consumption_daily:
     name: Pellet consumption (today)
-    source: sensor.solarfocus_pellet_heater_pelletsverbrauch_kg
+    source: sensor.solarfocus_pellet_heater_pelletsverbrauch
     cycle: daily
   pellet_consumption_weekly:
     name: Pellet consumption (this week)
-    source: sensor.solarfocus_pellet_heater_pelletsverbrauch_kg
+    source: sensor.solarfocus_pellet_heater_pelletsverbrauch
     cycle: weekly
   pellet_consumption_monthly:
     name: Pellet consumption (this month)
-    source: sensor.solarfocus_pellet_heater_pelletsverbrauch_kg
+    source: sensor.solarfocus_pellet_heater_pelletsverbrauch
     cycle: monthly
   pellet_consumption_yearly:
     name: Pellet consumption (this year)
-    source: sensor.solarfocus_pellet_heater_pelletsverbrauch_kg
+    source: sensor.solarfocus_pellet_heater_pelletsverbrauch
     cycle: yearly
 
 # ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ sensor:
   - platform: statistics
     name: Pellet consumption past 7 days
     unique_id: pellet_consumption_past_7_days
-    entity_id: sensor.solarfocus_pellet_heater_pelletsverbrauch_kg
+    entity_id: sensor.solarfocus_pellet_heater_pelletsverbrauch
     state_characteristic: change
     max_age:
       days: 7
@@ -61,7 +61,7 @@ sensor:
   - platform: statistics
     name: Pellet consumption past 30 days
     unique_id: pellet_consumption_past_30_days
-    entity_id: sensor.solarfocus_pellet_heater_pelletsverbrauch_kg
+    entity_id: sensor.solarfocus_pellet_heater_pelletsverbrauch
     state_characteristic: change
     max_age:
       days: 30
@@ -69,7 +69,7 @@ sensor:
   - platform: statistics
     name: Pellet consumption past 365 days
     unique_id: pellet_consumption_past_365_days
-    entity_id: sensor.solarfocus_pellet_heater_pelletsverbrauch_kg
+    entity_id: sensor.solarfocus_pellet_heater_pelletsverbrauch
     state_characteristic: change
     max_age:
       days: 365
@@ -128,12 +128,12 @@ template:
         unit_of_measurement: probes
         state: >
           {% set ids = [
-            'binary_sensor.solarfocus_pellet_heater_pellet_probe_1_full',
-            'binary_sensor.solarfocus_pellet_heater_pellet_probe_2_full',
-            'binary_sensor.solarfocus_pellet_heater_pellet_probe_3_full',
-            'binary_sensor.solarfocus_pellet_heater_pellet_probe_4_full',
-            'binary_sensor.solarfocus_pellet_heater_pellet_probe_5_full',
-            'binary_sensor.solarfocus_pellet_heater_pellet_probe_6_full',
+            'binary_sensor.solarfocus_pellet_heater_pellet_probe_1',
+            'binary_sensor.solarfocus_pellet_heater_pellet_probe_2',
+            'binary_sensor.solarfocus_pellet_heater_pellet_probe_3',
+            'binary_sensor.solarfocus_pellet_heater_pellet_probe_4',
+            'binary_sensor.solarfocus_pellet_heater_pellet_probe_5',
+            'binary_sensor.solarfocus_pellet_heater_pellet_probe_6',
           ] %}
           {{ ids | map('states') | rejectattr('==', 'on') | list | count }}
 
@@ -204,7 +204,7 @@ automation:
 #     icon: mdi:fire
 #     cards:
 #       - type: gauge
-#         entity: sensor.solarfocus_pellet_heater_brenner_fuellstand
+#         entity: sensor.solarfocus_pellet_heater_pellets_fullstand
 #         name: Brenner Füllstand
 #         min: 0
 #         max: 100
