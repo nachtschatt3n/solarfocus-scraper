@@ -19,6 +19,16 @@
 
 # ---------------------------------------------------------------------------
 # 1) Actual consumption per period (auto-resets at each cycle boundary)
+#
+#    HA QUIRK: utility_meter generates the entity_id slug from `name:`,
+#    not the dict key. So `name: "Pellet consumption (current hour)"`
+#    yields entity_id `sensor.pellet_consumption_current_hour`, not
+#    `sensor.pellet_consumption_hourly`. The Lovelace block at the
+#    bottom of this file references the auto-generated slugs.
+#
+#    If you'd rather have the slug match the dict key, drop `name:`
+#    entirely — but then the friendly name in the UI defaults to the
+#    capitalized dict key ("Pellet consumption hourly").
 # ---------------------------------------------------------------------------
 
 utility_meter:
@@ -216,15 +226,15 @@ automation:
 #       - type: entities
 #         title: Aktueller Verbrauch
 #         entities:
-#           - entity: sensor.pellet_consumption_hourly
+#           - entity: sensor.pellet_consumption_current_hour
 #             name: Stunde
-#           - entity: sensor.pellet_consumption_daily
+#           - entity: sensor.pellet_consumption_today
 #             name: Tag
-#           - entity: sensor.pellet_consumption_weekly
+#           - entity: sensor.pellet_consumption_this_week
 #             name: Woche
-#           - entity: sensor.pellet_consumption_monthly
+#           - entity: sensor.pellet_consumption_this_month
 #             name: Monat
-#           - entity: sensor.pellet_consumption_yearly
+#           - entity: sensor.pellet_consumption_this_year
 #             name: Jahr
 #
 #       - type: entities
@@ -250,7 +260,7 @@ automation:
 #         span:
 #           end: hour
 #         series:
-#           - entity: sensor.pellet_consumption_hourly
+#           - entity: sensor.pellet_consumption_current_hour
 #             type: column
 #             name: kg / Stunde
 #             group_by:
