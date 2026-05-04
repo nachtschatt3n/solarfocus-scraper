@@ -267,7 +267,11 @@ BBOXES: dict[str, FieldSpec] = {
     "og_status_text":           FieldSpec("heizkreise_og", (130, 410, 360, 28), FIELD_TEXT, "str", invert=True),
     "og_heizkreis_status":      FieldSpec("heizkreise_og", ( 80, 445, 520, 22), FIELD_TEXT, "str", invert=True),
     # Warmwasser (DHW) screen
-    "ww_ist_temp":   FieldSpec("warmwasser", (165, 178,  90, 28), FIELD_NUM,  "float"),
+    # bbox tightened: was (165, 178, 90, 28) which included the "°C" unit text
+    # to the right of the digits — tesseract read the unit + digits as one
+    # blob and hallucinated "so" / dropped digits. Narrowing to digits-only
+    # (65px wide, shifted +5px right) reads cleanly and still fits "70.7".
+    "ww_ist_temp":   FieldSpec("warmwasser", (170, 175,  65, 32), FIELD_NUM,  "float"),
     "ww_soll_temp":  FieldSpec("warmwasser", (460, 215, 140, 28), FIELD_NUM,  "float"),
     "ww_modus":      FieldSpec("warmwasser", (290, 365, 150, 25), FIELD_TEXT, "str"),
     # Betriebsstundenzähler page 3 — Wärmeverteilung (heat distribution counters).
