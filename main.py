@@ -232,7 +232,11 @@ BBOXES: dict[str, FieldSpec] = {
     # Tesseract's LSTM to seed from). All three were retuned 2026-04-24.
     "kesseltemperatur":     FieldSpec("main", (258, 386,  95, 24), FIELD_NUM,  "float"),
     "restsauerstoffgehalt": FieldSpec("main", (258, 414,  95, 24), FIELD_NUM,  "float"),
-    "outside_temperature":  FieldSpec("main", (550,  35,  60, 40), FIELD_NUM,  "float"),
+    # Width 60 was wide enough to include the "°C" unit suffix; tesseract
+    # occasionally read the "°" + "C" as a "7" digit, producing 177 from a
+    # real "17 °C" — looks like a plausible number but is an obvious bounds
+    # violation. Same fix as ww_ist_temp: narrow to digit-only (45 wide).
+    "outside_temperature":  FieldSpec("main", (550,  35,  45, 40), FIELD_NUM,  "float"),
     "status_text":          FieldSpec("main", (160, 448, 320, 28), FIELD_TEXT, "str", invert=True),
     # Betriebsstundenzähler page 1 (rows step ~35px starting at y=84)
     "saugzuggeblaese_h":          FieldSpec("betriebsstunden_p1", (430,  84, 100, 22), FIELD_NUM, "float"),
