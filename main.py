@@ -253,8 +253,14 @@ BBOXES: dict[str, FieldSpec] = {
     "betriebsstunden_seit_wartung_h": FieldSpec("betriebsstunden_p2", (430, 189, 100, 22), FIELD_NUM, "float"),
     "pelletsverbrauch_kg":            FieldSpec("betriebsstunden_p2", (430, 224, 100, 22), FIELD_NUM, "float"),
     # Kessel screen
-    "puffer_temp_top":     FieldSpec("kessel", (335, 152,  90, 25), FIELD_NUM,  "float"),
-    "puffer_temp_bottom":  FieldSpec("kessel", (320, 320,  75, 30), FIELD_NUM,  "float"),
+    # Same °C-suffix issue as outside_temperature / ww_ist_temp: original
+    # widths included the unit text and tesseract was reading "° + C" as
+    # a digit, producing artefacts like 86 (real 51) or 388 (real 38),
+    # and "out of bounds" / huge-delta rejections every cycle. Tightened
+    # to digit-only crops with extra vertical padding so 3-char values
+    # ("100" or "-5") still fit.
+    "puffer_temp_top":     FieldSpec("kessel", (335, 150,  52, 30), FIELD_NUM,  "float"),
+    "puffer_temp_bottom":  FieldSpec("kessel", (317, 318,  55, 32), FIELD_NUM,  "float"),
     # Bbox retuned 2026-04-28: the dark-on-grey "Keine Anforderung an Kessel"
     # row sits at y=412-426; the old (100, 398, 440, 30) only grazed the top
     # half of the glyphs, producing OCR like "Keine AÄnforderuna an Kessel".
