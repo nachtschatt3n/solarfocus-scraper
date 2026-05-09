@@ -220,6 +220,8 @@ class FieldSpec:
     kind: str                        # "float" | "int" | "str"
     invert: bool = False
     engine: str = "tesseract"        # "tesseract" | "template"
+    lcd: bool = False                # apply Otsu binarize pipeline (for LCD-style displays
+                                     # where naive 2x upscale + LSTM drops the trailing digit)
 
 BBOXES: dict[str, FieldSpec] = {
     # main screen
@@ -281,7 +283,11 @@ BBOXES: dict[str, FieldSpec] = {
     # to the right of the digits — tesseract read the unit + digits as one
     # blob and hallucinated "so" / dropped digits. Narrowing to digits-only
     # (65px wide, shifted +5px right) reads cleanly and still fits "70.7".
-    "ww_ist_temp":   FieldSpec("warmwasser", (170, 175,  65, 32), FIELD_NUM,  "float"),
+    # lcd=True applies the Otsu-binarize pipeline. The DHW tank readout is
+    # rendered in an LCD-style font where the naive 2x grayscale upscale
+    # occasionally drops the trailing digit ("74" → "7"). 3x + Otsu reads
+    # this font reliably across captures.
+    "ww_ist_temp":   FieldSpec("warmwasser", (170, 175,  65, 32), FIELD_NUM,  "float", lcd=True),
     "ww_soll_temp":  FieldSpec("warmwasser", (460, 215, 140, 28), FIELD_NUM,  "float"),
     "ww_modus":      FieldSpec("warmwasser", (290, 365, 150, 25), FIELD_TEXT, "str"),
     # Betriebsstundenzähler page 3 — Wärmeverteilung (heat distribution counters).
@@ -655,15 +661,56 @@ def crop(img: Image.Image, region: tuple[int, int, int, int]) -> Image.Image:
 def region_hash(img: Image.Image, region: tuple[int, int, int, int]) -> str:
     return hashlib.sha256(crop(img, region).tobytes()).hexdigest()
 
+def _otsu_threshold(gray: Image.Image) -> int:
+    """Otsu's automatic threshold for grayscale image. Pure-PIL, no numpy.
+    Returns the gray level (0-255) that best separates foreground/background
+    by maximising between-class variance. Used by the LCD pipeline to adapt
+    to lighting/anti-aliasing variation that fixed thresholds can't handle."""
+    hist = gray.histogram()
+    total = sum(hist)
+    sum_total = sum(i * h for i, h in enumerate(hist))
+    sum_b = 0.0
+    w_b = 0
+    max_var = 0.0
+    thresh = 0
+    for i in range(256):
+        w_b += hist[i]
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += i * hist[i]
+        m_b = sum_b / w_b
+        m_f = (sum_total - sum_b) / w_f
+        var = w_b * w_f * (m_b - m_f) ** 2
+        if var > max_var:
+            max_var = var
+            thresh = i
+    return thresh
+
 def ocr(img: Image.Image, region: tuple[int, int, int, int], config: str,
-        lang: str = "deu", invert: bool = False) -> str:
+        lang: str = "deu", invert: bool = False, lcd: bool = False) -> str:
     from PIL import ImageOps
     c = crop(img, region)
     if invert:
         # Grayscale-then-invert handles white-on-blue (status bars) much better
         # than RGB invert, which produces low-contrast yellow-on-yellow.
         c = ImageOps.invert(c.convert("L"))
-    big = c.resize((c.width * 2, c.height * 2), Image.LANCZOS)
+    if lcd:
+        # LCD pipeline: 3x LANCZOS upscale + Otsu binarize. The straight 2x
+        # grayscale path occasionally drops the trailing digit on this LCD-
+        # style font (e.g. "74" → "7") — once that misread persists 3 cycles,
+        # the delta-override breaker accepts the bad value as the new baseline.
+        # Otsu binarisation gives tesseract pure black-and-white pixels with
+        # no anti-aliasing greys, which is what its LSTM was actually trained
+        # on. Validated on the warmwasser tank readout.
+        gray = c.convert("L")
+        big = gray.resize((gray.width * 3, gray.height * 3), Image.LANCZOS)
+        t = _otsu_threshold(big)
+        big = big.point(lambda p: 0 if p < t else 255, mode="L")
+    else:
+        big = c.resize((c.width * 2, c.height * 2), Image.LANCZOS)
     return pytesseract.image_to_string(big, lang=lang, config=config).strip()
 
 def parse_value(raw: str, kind: str) -> Optional[float | int | str]:
@@ -1893,7 +1940,7 @@ def _ocr_all(img_by_screen: dict[str, Image.Image]) -> dict[str, object]:
         if spec.engine == "template":
             raw = ocr_digits_template(img, spec.bbox)
         else:
-            raw = ocr(img, spec.bbox, spec.config, invert=spec.invert)
+            raw = ocr(img, spec.bbox, spec.config, invert=spec.invert, lcd=spec.lcd)
         parsed = parse_value(raw, spec.kind)
         out[field] = parsed
         event(logging.DEBUG, "ocr_result", "ocr value",
