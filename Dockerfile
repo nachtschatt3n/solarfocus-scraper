@@ -7,12 +7,19 @@
 FROM python:3.12-slim-trixie AS base
 
 # Tesseract + German lang pack for OCR. apt cache is cleaned in the same RUN
-# layer so it doesn't bloat the image.
+# layer so it doesn't bloat the image. The `apt-get upgrade` step refreshes
+# any Debian point-release security patches that the base-image tag hasn't
+# absorbed yet — combined with the weekly scheduled rebuild
+# (.github/workflows/scheduled-rebuild.yml) this keeps OS-level CVE noise
+# (libgnutls, libarchive, libgif, etc.) from accumulating against the
+# pinned base tag.
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends \
         tesseract-ocr \
         tesseract-ocr-deu \
         ca-certificates \
+ && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
 # Non-root runtime user (uid matches the HelmRelease securityContext).
