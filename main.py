@@ -739,7 +739,7 @@ def fill_level_percent(img: Image.Image) -> Optional[float]:
     if FILL_BAR_REGION is None or any(v is None for v in FILL_BAR_REGION):
         return None
     bar = crop(img, FILL_BAR_REGION).convert("L")
-    pixels = list(bar.getdata())
+    pixels = list(bar.get_flattened_data())
     if not pixels:
         return None
     filled = sum(1 for p in pixels if p < FILL_BAR_FILLED_THRESHOLD)
@@ -752,7 +752,7 @@ def probe_dot_state(img: Image.Image, region: tuple[int, int, int, int]) -> Opti
     anti-aliased edges and grey borders without rejecting legitimate saturated
     dots."""
     rgb = crop(img, region).convert("RGB")
-    px = list(rgb.getdata())
+    px = list(rgb.get_flattened_data())
     r_sum = sum(p[0] for p in px)
     g_sum = sum(p[1] for p in px)
     if g_sum > r_sum * 1.2:
@@ -870,7 +870,7 @@ def _match_glyph(glyph: Image.Image, templates: dict[str, Image.Image]) -> Optio
         resized = glyph.resize(tpl.size, Image.LANCZOS)
         resized = _binarize(resized)
         diff = ImageChops.difference(resized, tpl)
-        score = sum(diff.getdata())
+        score = sum(diff.get_flattened_data())
         if score < best_score:
             best_score = score
             best_digit = digit
