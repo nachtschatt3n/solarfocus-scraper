@@ -374,7 +374,15 @@ SANITY_BOUNDS: dict[str, tuple[float, float]] = {
     "puffer_temp_bottom":             (-10, 120),
     "og_vorlauftemperatur":           (0, 90),
     "og_vorlaufsolltemperatur":       (0, 90),
-    "ww_ist_temp":                    (0, 90),
+    # Bumped lower bound 0 → 20: even with the LCD/Otsu pipeline, tesseract
+    # occasionally drops the trailing digit on this readout ("74" → "7"). When
+    # the misread persists 3 cycles, the delta-override breaker accepts the
+    # bad value as the new baseline, and the death-spiral takes ~20 min to
+    # unwind once OCR drifts back. The DHW tank is never below 20 °C in normal
+    # operation, so this bound rejects any "7"/"5" misread as out-of-bounds
+    # (which never progresses the confirmation counter — the breaker is
+    # delta-based only) and keeps the last-known-good value pinned.
+    "ww_ist_temp":                    (20, 90),
     "ww_soll_temp":                   (0, 90),
     "rla_pumpe_h":                    (0, 1_000_000),
     "og_h":                           (0, 1_000_000),
