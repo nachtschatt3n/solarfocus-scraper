@@ -62,7 +62,11 @@ jobs:
             ${{ env.IMAGE }}:sha-${{ github.sha }}
 
       - name: Trivy scan (informational — does not fail the build)
-        uses: aquasecurity/trivy-action@0.28.0
+        # Pin to a v-prefixed tag — aquasecurity yanked the un-prefixed `0.28.0`
+        # tag at some point after this workflow was authored, which made every
+        # Monday rebuild fail with "Unable to resolve action ... unable to find
+        # version `0.28.0`".
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}:weekly-${{ steps.date.outputs.tag }}
           severity: CRITICAL,HIGH
