@@ -142,12 +142,17 @@ SCREENS: dict[str, Screen] = {
     ),
     # Alert modals — Solarfocus pops these over any screen when maintenance or
     # fault conditions fire (e.g. "KESSELREINIGUNG EMPFOHLEN!", "Pellet Mangel",
-    # ...). Hash region is the blue info icon centered at the top, which is the
-    # same graphic across every info-type alert — so the same fingerprint covers
-    # arbitrary future alert text. back_xy points at the OK button so the
-    # state-machine's generic "click back to escape unknown" path dismisses the
-    # modal automatically. run_cycle() additionally OCRs the body and publishes
-    # it to MQTT before dismissing.
+    # ...). back_xy points at the OK button so the state-machine's generic "click
+    # back to escape unknown" path dismisses the modal automatically. run_cycle()
+    # additionally OCRs the body and publishes it to MQTT before dismissing.
+    #
+    # The hash below is an exact-match fast path for ONE alert's layout. It is
+    # NOT a reliable fingerprint across alerts: the box overlaps the first body
+    # text line, which changes per alert, so a different modal (e.g. WARTUNG-
+    # INSPEKTION) produces a different hash and would be "unknown" — that aborted
+    # navigation on 2026-07-31. The real catch-all is the icon-SHAPE fallback in
+    # `_identify_screen` (`looks_like_info_modal`), which matches every info modal
+    # regardless of body text; the hash just makes the common case zero-cost.
     "alert_modal": Screen(
         hash_region=(290, 50, 60, 60),  # blue info "i" icon, shared across all info alerts
         expected_hash="8168a4c150516591af7479070357376bb44c443b2efb8f1a3d00672b9dc3199e",
@@ -347,6 +352,32 @@ PROBE_DOT_REGIONS: dict[int, tuple[int, int, int, int]] = {
 # of each potential frame — whichever is saturated green is the active mode.
 SAUGAUSTRAGUNG_AUTO_FRAME_XY = (15, 200)
 SAUGAUSTRAGUNG_MAN_FRAME_XY  = (15, 420)
+
+# --- Info-modal graphical fingerprint -------------------------------------
+# Solarfocus draws every info-type alert (KESSELREINIGUNG, WARTUNG-INSPEKTION,
+# Pellet Mangel, ...) as the *same* full-screen white dialog with a blue "i"
+# icon centred at the top and a single OK button at the bottom. Only the body
+# text changes between alerts. The original alert_modal.hash_region tried to
+# fingerprint the icon but its box (290,50,60,60) clipped the icon's bottom and
+# bled into the first *text* line — so the hash silently differed per alert and
+# the WARTUNG-INSPEKTION reminder went unrecognised, aborting navigation
+# (incident 2026-07-31). This graphical check fingerprints the icon by shape,
+# not by hash, so it catches every info modal regardless of body text:
+#   1. white dialog background (data screens are grey) sampled at the corners,
+#   2. a compact blue circle inside a tight top-centre box, and
+#   3. white margins immediately left+right of that circle (a full-width blue
+#      title bar — present on several data screens — fails this, a circle passes).
+# Validated true-positive on the WARTUNG modal and false-negative on all known
+# data screens (kessel/og/fbh/warmwasser/p3/probe/saugaustragung) — see
+# tests/test_screen_recognition.py.
+INFO_MODAL_BG_SAMPLE_XY: tuple[tuple[int, int], ...] = (
+    (20, 20), (620, 20), (20, 240), (620, 240), (20, 460), (620, 460),
+)
+INFO_MODAL_BG_WHITE_MIN = 5           # ≥5 of 6 corners must be white
+INFO_MODAL_ICON_BOX = (294, 34, 43, 42)  # x,y,w,h — tight box around the "i" circle
+INFO_MODAL_ICON_BLUE_MIN = 150        # min strongly-blue pixels inside the box
+INFO_MODAL_LEFT_XY  = (275, 54)       # white on a modal, blue on a title bar
+INFO_MODAL_RIGHT_XY = (356, 54)
 
 # Sanity bounds. Status_text excluded (string).
 SANITY_BOUNDS: dict[str, tuple[float, float]] = {
@@ -784,6 +815,38 @@ def saugaustragung_mode(img: Image.Image) -> Optional[str]:
     if is_green(SAUGAUSTRAGUNG_MAN_FRAME_XY):
         return "MAN"
     return None
+
+def looks_like_info_modal(img: Image.Image) -> bool:
+    """True if `img` is one of the heater's info-type alert dialogs (blue "i"
+    icon on a white full-screen dialog), regardless of the body text.
+
+    Shape-based, not hash-based, so it survives the per-alert text variation
+    that broke the alert_modal hash. Used by `_identify_screen` as a last-resort
+    fallback so any info modal is recognised and dismissed rather than aborting
+    navigation as an unknown screen. See INFO_MODAL_* constants for the checks."""
+    rgb = img.convert("RGB")
+    px = rgb.load()
+
+    def is_white(xy: tuple[int, int]) -> bool:
+        r, g, b = px[xy[0], xy[1]][:3]
+        return r > 200 and g > 200 and b > 200
+
+    # 1. white dialog background (data screens are grey)
+    white_bg = sum(1 for xy in INFO_MODAL_BG_SAMPLE_XY if is_white(xy))
+    if white_bg < INFO_MODAL_BG_WHITE_MIN:
+        return False
+    # 2. white margins beside the icon (rejects full-width blue title bars)
+    if not (is_white(INFO_MODAL_LEFT_XY) and is_white(INFO_MODAL_RIGHT_XY)):
+        return False
+    # 3. a compact blue circle inside the tight top-centre icon box
+    x0, y0, w, h = INFO_MODAL_ICON_BOX
+    blue = 0
+    for y in range(y0, y0 + h):
+        for x in range(x0, x0 + w):
+            r, g, b = px[x, y][:3]
+            if b > 120 and b - r > 60 and b - g > 40:
+                blue += 1
+    return blue >= INFO_MODAL_ICON_BLUE_MIN
 
 # =============================================================================
 # Template-matching OCR (deterministic, CPU-independent)
@@ -1836,6 +1899,16 @@ def _identify_screen(img: Image.Image) -> Optional[str]:
                           old_hash=screen.expected_hash,
                           ocr_text_seen=text.strip()[:120])
             return name
+    # Last-resort fallback: any info-type alert modal, matched by the blue "i"
+    # icon shape rather than an exact hash. This makes alert_modal a true
+    # catch-all — the hash fast-path only fingerprints one alert's layout, but
+    # the icon graphic is shared across all of them (KESSELREINIGUNG, WARTUNG-
+    # INSPEKTION, Pellet Mangel, ...). Without this a not-yet-hashed modal is
+    # "unknown", and the generic back-arrow recovery can't dismiss a centred
+    # OK-only dialog → navigate aborts (incident 2026-07-31).
+    if "alert_modal" in SCREENS and looks_like_info_modal(img):
+        m_screen_ident.labels(screen="alert_modal", via="icon").inc()
+        return "alert_modal"
     m_screen_unknown.inc()
     return None
 
