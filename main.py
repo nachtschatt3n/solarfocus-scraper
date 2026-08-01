@@ -288,11 +288,18 @@ BBOXES: dict[str, FieldSpec] = {
     # to the right of the digits — tesseract read the unit + digits as one
     # blob and hallucinated "so" / dropped digits. Narrowing to digits-only
     # (65px wide, shifted +5px right) reads cleanly and still fits "70.7".
-    # lcd=True applies the Otsu-binarize pipeline. The DHW tank readout is
-    # rendered in an LCD-style font where the naive 2x grayscale upscale
-    # occasionally drops the trailing digit ("74" → "7"). 3x + Otsu reads
-    # this font reliably across captures.
-    "ww_ist_temp":   FieldSpec("warmwasser", (170, 175,  65, 32), FIELD_NUM,  "float", lcd=True),
+    # lcd=True applies the Otsu-binarize pipeline for the LCD-style DHW font.
+    # BBOX Y-START IS LOAD-BEARING: the LCD readout box has a full-width dark
+    # shadow line at y≈182-185, just above the digits (which sit ~y188-207).
+    # The old box started at y=175 and swallowed that line; Otsu turned it into
+    # a solid black bar fused to the digit tops, so tesseract mis-segmented and
+    # dropped the 2nd digit ("75" → "7", "74" → "7"). That silently pinned
+    # warmwasser_ist and kept scraper_status at "partial" (the [20,90] bound
+    # rejected the bogus 7). Fix: start the crop at y=187 (below the shadow
+    # bar), height 22 to cover the digits, width 72 to still exclude the "°C"
+    # suffix (starts ~x245). Verified reading 75 (live) and 74 (reference) in
+    # BOTH the lcd and plain pipelines — see tests/test_ocr_ww_ist_temp.py.
+    "ww_ist_temp":   FieldSpec("warmwasser", (168, 187,  72, 22), FIELD_NUM,  "float", lcd=True),
     "ww_soll_temp":  FieldSpec("warmwasser", (460, 215, 140, 28), FIELD_NUM,  "float"),
     "ww_modus":      FieldSpec("warmwasser", (290, 365, 150, 25), FIELD_TEXT, "str"),
     # Betriebsstundenzähler page 3 — Wärmeverteilung (heat distribution counters).
@@ -1124,6 +1131,27 @@ def publish_discovery(broker: MqttBroker) -> None:
         "object_id": f"{MQTT_DEVICE_ID}_alert_last_seen",
         "state_topic": f"{MQTT_TOPIC_PREFIX}/alert/last_seen",
         "device_class": "timestamp",
+        "device": DEVICE_BLOCK,
+    }, retain=True)
+
+    # Last-error image — on a navigation failure, _handle_nav_fail() publishes
+    # the framebuffer it got stuck on (base64 PNG, retained) to
+    # scraper/last_error_image. Surfacing it as an HA `image.` entity lets a
+    # dashboard picture-card show the exact screen the scraper aborted on
+    # (e.g. an unrecognised modal) instead of the operator only seeing a
+    # Prometheus alert. image_encoding=b64 matches the base64 payload;
+    # content_type=image/png matches what we publish; diagnostic category so
+    # it groups with the other scraper-health entities. Retained discovery, so
+    # the entity survives a scraper/HA restart and the last stuck-frame stays
+    # visible until the next failure overwrites it.
+    broker.publish(f"{MQTT_DISCOVERY_PREFIX}/image/{MQTT_DEVICE_ID}/last_error_image/config", {
+        "name": "Last Error Image",
+        "unique_id": f"{MQTT_DEVICE_ID}_last_error_image",
+        "object_id": f"{MQTT_DEVICE_ID}_last_error_image",
+        "image_topic": f"{MQTT_TOPIC_PREFIX}/scraper/last_error_image",
+        "image_encoding": "b64",
+        "content_type": "image/png",
+        "entity_category": "diagnostic",
         "device": DEVICE_BLOCK,
     }, retain=True)
 
