@@ -188,6 +188,8 @@ Images are pushed to `ghcr.io/nachtschatt3n/solarfocus-scraper:latest` on every 
 | `MQTT_TOPIC_PREFIX` | `solarfocus` | |
 | `MQTT_DISCOVERY_PREFIX` | `homeassistant` | Match HA's discovery prefix |
 | `MQTT_DEVICE_ID` | `solarfocus_pellettop` | |
+| `MQTT_CONNECT_BACKOFF_INITIAL_SECONDS` | `1` | First retry delay when the broker is unreachable at startup; doubles each attempt |
+| `MQTT_CONNECT_BACKOFF_MAX_SECONDS` | `60` | Cap for the initial-connect backoff **and** paho's mid-run auto-reconnect delay |
 | `SCRAPE_INTERVAL_SECONDS` | `300` | |
 | `VNC_CONNECT_TIMEOUT_SECONDS` | `10` | |
 | `CLICK_DELAY_SECONDS` | `1.5` | Time to sleep between clicks — bump if your heater's UI feels sluggish |

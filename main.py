@@ -596,6 +596,14 @@ MQTT_PORT = int(env("MQTT_PORT", "1883"))
 MQTT_TOPIC_PREFIX = env("MQTT_TOPIC_PREFIX", "solarfocus")
 MQTT_DISCOVERY_PREFIX = env("MQTT_DISCOVERY_PREFIX", "homeassistant")
 MQTT_DEVICE_ID = env("MQTT_DEVICE_ID", "solarfocus_pellettop")
+# Initial-connect + auto-reconnect backoff. The broker (Mosquitto) is briefly
+# unreachable during node reboots / mosquitto restarts; a bare connect() there
+# raises ConnectionRefusedError, the process exits 1, and k8s CrashLoopBackOffs
+# it (pages CRITICAL for a transient blip). Instead we retry the initial connect
+# with exponential backoff (capped) and let paho's loop thread auto-reconnect
+# mid-run with the same cap — the scraper waits for the broker instead of dying.
+MQTT_CONNECT_BACKOFF_INITIAL_SECONDS = float(env("MQTT_CONNECT_BACKOFF_INITIAL_SECONDS", "1"))
+MQTT_CONNECT_BACKOFF_MAX_SECONDS = float(env("MQTT_CONNECT_BACKOFF_MAX_SECONDS", "60"))
 SCRAPE_INTERVAL_SECONDS = int(env("SCRAPE_INTERVAL_SECONDS", "300"))
 VNC_CONNECT_TIMEOUT_SECONDS = int(env("VNC_CONNECT_TIMEOUT_SECONDS", "10"))
 CLICK_DELAY_SECONDS = float(env("CLICK_DELAY_SECONDS", "1.5"))
@@ -986,18 +994,59 @@ class MqttBroker:
             client_id=f"{MQTT_DEVICE_ID}-scraper",
         )
         self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
         self.pause_state: bool = False  # mirrors retained solarfocus/scraper/pause
         self.last_values: dict[str, str] = {}  # field -> last retained value (string)
         self._lock = threading.Lock()
 
     def connect(self) -> None:
-        self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+        # Mid-run drops (node reboot, broker restart): paho's loop thread
+        # auto-reconnects on its own once the first connection has succeeded —
+        # bound its backoff to the same cap as the initial connect.
+        self.client.reconnect_delay_set(
+            min_delay=int(MQTT_CONNECT_BACKOFF_INITIAL_SECONDS),
+            max_delay=int(MQTT_CONNECT_BACKOFF_MAX_SECONDS),
+        )
+        self._connect_with_backoff()
         self.client.loop_start()
+
+    def _connect_with_backoff(self, sleep=time.sleep) -> None:
+        """Retry the initial connect with exponential backoff (capped) until the
+        broker accepts us, instead of raising and crash-looping the process.
+        `sleep` is injectable so the retry path is unit-testable without waiting.
+        """
+        delay = MQTT_CONNECT_BACKOFF_INITIAL_SECONDS
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+                if attempt > 1:
+                    event(logging.INFO, "mqtt_connect_recovered",
+                          "MQTT broker reachable after retries",
+                          attempts=attempt, host=MQTT_HOST, port=MQTT_PORT)
+                return
+            except OSError as e:
+                # ConnectionRefusedError / timeout / DNS failure are all OSError.
+                event(logging.WARNING, "mqtt_connect_retry",
+                      "MQTT broker unreachable; will retry",
+                      attempt=attempt, error=str(e), retry_in_s=round(delay, 1),
+                      host=MQTT_HOST, port=MQTT_PORT)
+                sleep(delay)
+                delay = min(delay * 2, MQTT_CONNECT_BACKOFF_MAX_SECONDS)
 
     def disconnect(self) -> None:
         self.client.loop_stop()
         self.client.disconnect()
+
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
+        # Unexpected drop (reason_code != 0): paho's loop thread will reconnect
+        # automatically per reconnect_delay_set — just log it, don't exit.
+        if reason_code:
+            event(logging.WARNING, "mqtt_disconnected",
+                  "MQTT connection lost; auto-reconnecting",
+                  reason_code=str(reason_code), host=MQTT_HOST, port=MQTT_PORT)
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         event(logging.INFO, "mqtt_connected", "MQTT connected", host=MQTT_HOST, port=MQTT_PORT)
