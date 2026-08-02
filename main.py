@@ -88,13 +88,13 @@ SCREENS: dict[str, Screen] = {
     ),
     "auswahlmenue": Screen(
         hash_region=(85, 5, 200, 30),  # header bar text
-        expected_hash="420b8d677a88f5868bb1e18a021857ddb2ad73283ee9a57acac9a886cb08299d",
+        expected_hash="8eafa7385c46000fc4014b764997f67d16e4cf129b1bdb594629fb9f6b886127",
         parent="main",
         ocr_text="Auswahl",  # "Auswahlmenü" — umlaut-tolerant substring
     ),
     "kundenmenue": Screen(
         hash_region=(85, 5, 200, 30),
-        expected_hash="1e1ff73b4be210f3bc7998a69f1b3e9605c6c0dffb0f879f7fd3ffdec26abdaf",
+        expected_hash="40ea3e44dd414dc6c253b19c4688355d32a8e9f89b20066841c0b6ab912e72be",
         parent="auswahlmenue",
         ocr_text="Kunden",  # "Kundenmenü"
     ),
@@ -112,7 +112,7 @@ SCREENS: dict[str, Screen] = {
     ),
     "betriebsstunden_p3": Screen(
         hash_region=(85, 5, 470, 30),  # "Betriebsstundenzähler Wärmeverteilung" header
-        expected_hash="ac5029cc4aea6d21720a014609bcbba0dd08ea78c04479b1efce838028f4b3d1",
+        expected_hash="138044077cbb779fd5d703deedd64c4a742dfa184e79042c2d5ce0919c18bb38",
         parent="kundenmenue",
         # Persistent alert banners ("Pelletsmangel im Lagerraum!" etc.) can
         # overwrite the header text, which breaks the hash and makes the
