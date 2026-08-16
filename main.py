@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -141,23 +142,29 @@ SCREENS: dict[str, Screen] = {
         ocr_text="Trinkwasserspeicher",
     ),
     # Alert modals — Solarfocus pops these over any screen when maintenance or
-    # fault conditions fire (e.g. "KESSELREINIGUNG EMPFOHLEN!", "Pellet Mangel",
-    # ...). back_xy points at the OK button so the state-machine's generic "click
-    # back to escape unknown" path dismisses the modal automatically. run_cycle()
-    # additionally OCRs the body and publishes it to MQTT before dismissing.
+    # fault conditions fire (e.g. "KESSELREINIGUNG EMPFOHLEN!", "PELLETSMANGEL
+    # IM LAGERRAUM", ...). run_cycle() OCRs the body and publishes it to MQTT
+    # before dismissing.
     #
-    # The hash below is an exact-match fast path for ONE alert's layout. It is
-    # NOT a reliable fingerprint across alerts: the box overlaps the first body
-    # text line, which changes per alert, so a different modal (e.g. WARTUNG-
-    # INSPEKTION) produces a different hash and would be "unknown" — that aborted
-    # navigation on 2026-07-31. The real catch-all is the icon-SHAPE fallback in
-    # `_identify_screen` (`looks_like_info_modal`), which matches every info modal
-    # regardless of body text; the hash just makes the common case zero-cost.
+    # `back_xy` is DELIBERATELY NOT SET here, and nothing may set it: the
+    # dismiss point is derived per-capture from the detected dialog geometry by
+    # `_dismiss_xy_for()` / `find_info_modal()`. A fixed coordinate cannot
+    # work — it used to be (320, 410), the centre of the full-screen variant's
+    # OK button, which on the inset variant is empty gap between two buttons at
+    # x[20,184] and x[452,616] (incident 2026-08-16). Worse, a fixed coordinate
+    # cannot tell an inert pixel from an ACTION button: the inset dialog's
+    # bottom-right button is "Lagerraum befüllt", and clicking it to escape
+    # would have falsified the heater's pellet-store state.
+    #
+    # The hash below is an exact-match fast path for ONE alert's layout, kept
+    # only because it is free. It is NOT a fingerprint across alerts: the box
+    # overlaps the first body text line, which changes per alert. The real
+    # catch-all is the icon-SHAPE detector `looks_like_info_modal`, which
+    # `_identify_screen` now runs BEFORE any hash/OCR match.
     "alert_modal": Screen(
         hash_region=(290, 50, 60, 60),  # blue info "i" icon, shared across all info alerts
         expected_hash="8168a4c150516591af7479070357376bb44c443b2efb8f1a3d00672b9dc3199e",
         parent="main",           # dismissing takes us back to underlying screen; main is a safe retry anchor
-        back_xy=(320, 410),      # OK button
     ),
     # Live floor-heating heat-circuit screen. Reached via the right-arrow on
     # heizkreise_og. The standard back arrow at (35,30) is hidden behind the
@@ -360,31 +367,66 @@ PROBE_DOT_REGIONS: dict[int, tuple[int, int, int, int]] = {
 SAUGAUSTRAGUNG_AUTO_FRAME_XY = (15, 200)
 SAUGAUSTRAGUNG_MAN_FRAME_XY  = (15, 420)
 
-# --- Info-modal graphical fingerprint -------------------------------------
+# --- Info-modal graphical fingerprint (offset-tolerant) -------------------
 # Solarfocus draws every info-type alert (KESSELREINIGUNG, WARTUNG-INSPEKTION,
-# Pellet Mangel, ...) as the *same* full-screen white dialog with a blue "i"
-# icon centred at the top and a single OK button at the bottom. Only the body
-# text changes between alerts. The original alert_modal.hash_region tried to
-# fingerprint the icon but its box (290,50,60,60) clipped the icon's bottom and
-# bled into the first *text* line — so the hash silently differed per alert and
-# the WARTUNG-INSPEKTION reminder went unrecognised, aborting navigation
-# (incident 2026-07-31). This graphical check fingerprints the icon by shape,
-# not by hash, so it catches every info modal regardless of body text:
-#   1. white dialog background (data screens are grey) sampled at the corners,
-#   2. a compact blue circle inside a tight top-centre box, and
-#   3. white margins immediately left+right of that circle (a full-width blue
-#      title bar — present on several data screens — fails this, a circle passes).
-# Validated true-positive on the WARTUNG modal and false-negative on all known
-# data screens (kessel/og/fbh/warmwasser/p3/probe/saugaustragung) — see
-# tests/test_screen_recognition.py.
-INFO_MODAL_BG_SAMPLE_XY: tuple[tuple[int, int], ...] = (
-    (20, 20), (620, 20), (20, 240), (620, 240), (20, 460), (620, 460),
-)
-INFO_MODAL_BG_WHITE_MIN = 5           # ≥5 of 6 corners must be white
-INFO_MODAL_ICON_BOX = (294, 34, 43, 42)  # x,y,w,h — tight box around the "i" circle
-INFO_MODAL_ICON_BLUE_MIN = 150        # min strongly-blue pixels inside the box
-INFO_MODAL_LEFT_XY  = (275, 54)       # white on a modal, blue on a title bar
-INFO_MODAL_RIGHT_XY = (356, 54)
+# PELLETSMANGEL IM LAGERRAUM, ...) with the SAME blue "i" icon on a white
+# dialog; only the body text changes. The icon is therefore the fingerprint —
+# fingerprinting by hash never worked, because the hash box bleeds into the
+# per-alert body text (incident 2026-07-31).
+#
+# There are (at least) TWO layout variants, and that is the point of this block:
+#   * full-screen — dialog covers the display, icon top-left at (294, 34), a
+#     single centred OK button at the bottom.  [WARTUNG-INSPEKTION]
+#   * inset       — dialog is drawn BELOW the host screen's title bar, icon at
+#     (299, 85) (+51px down, +5px right), a back-arrow button top-left inside
+#     the dialog, and TWO action buttons at the bottom.
+#     [PELLETSMANGEL over Saugaustragung, incident 2026-08-16]
+#
+# The first detector hard-coded the full-screen icon box and its white-margin
+# probe points, so on the inset variant it counted 0 blue pixels against a
+# required 150 and its margin probes landed on the host title bar. Not a modal
+# → the modal was never dismissed → navigation tapped inert pixels for 3.5h.
+#
+# So: nothing here is an absolute coordinate except the search band. Locate the
+# icon by SCANNING, then validate everything RELATIVE to that anchor.
+INFO_MODAL_ICON_W = 43
+INFO_MODAL_ICON_H = 42
+# Icon search band (x0, y0, x1, y1). x is generous around screen-centre (the
+# icon is centred on the dialog, the dialog is centred on the display); y spans
+# the full-screen (34) and inset (85) variants plus headroom for further ones.
+INFO_MODAL_SCAN_BAND = (250, 15, 400, 240)
+INFO_MODAL_ICON_BLUE_MIN = 150   # candidate floor: strongly-blue px in the box
+# The icon is a filled circle inscribed in the box — ~0.54 of the box area with
+# this blue predicate. A solid blue title bar or button scores ~1.00; a stray
+# blue glyph scores <0.25. This range is what separates a circle from both, and
+# it is the check that kills every false positive in the fixture corpus.
+INFO_MODAL_ICON_FILL_MIN = 0.35
+INFO_MODAL_ICON_FILL_MAX = 0.80
+# White margins immediately left AND right of the icon at its mid-height,
+# measured relative to the anchor. A full-width blue title bar fails both.
+INFO_MODAL_MARGIN_DX: tuple[int, ...] = (14, 19)
+# The dialog body below the icon must be predominantly white (data screens are
+# grey and busy). Coarse grid, again relative to the anchor.
+INFO_MODAL_BODY_DY = (40, 170, 10)   # start, stop, step below the icon centre
+INFO_MODAL_BODY_DX_STEP = 16
+INFO_MODAL_BODY_WHITE_MIN = 0.80
+
+# --- Modal dismiss geometry ------------------------------------------------
+# NEVER escape a modal by clicking an acknowledge button. The PELLETSMANGEL
+# dialog's bottom-right button is "Lagerraum befüllt" — clicking it to get out
+# of the way would tell the heater the pellet store had been refilled, i.e. the
+# scraper would have falsified heater state to unblock itself. Preference:
+#   1. the modal's own back arrow — pure navigation, mutates nothing,
+#   2. a SINGLE centred OK button — acknowledge-only dialogs have no other exit
+#      and the OK is the dialog's designed dismissal,
+#   3. nothing. Two or more bottom buttons and no back arrow is ambiguous; we
+#      refuse to guess and let the caller escalate (the stuck-screen guard in
+#      navigate_to turns that into a diagnosable event rather than a stall).
+INFO_MODAL_BACK_ARROW_MIN_YELLOW = 150  # yellow px making up the arrow glyph
+INFO_MODAL_BACK_ARROW_NAVY_MIN = 0.25   # navy fraction of the button around it
+INFO_MODAL_OK_MIN_RUN_PX = 60           # min horizontal run to count as a button
+INFO_MODAL_OK_MAX_OFF_CENTRE = 80       # an OK button is centred; anything else
+                                        # is an action button — do not click it
 
 # Sanity bounds. Status_text excluded (string).
 SANITY_BOUNDS: dict[str, tuple[float, float]] = {
@@ -607,10 +649,33 @@ MQTT_CONNECT_BACKOFF_MAX_SECONDS = float(env("MQTT_CONNECT_BACKOFF_MAX_SECONDS",
 SCRAPE_INTERVAL_SECONDS = int(env("SCRAPE_INTERVAL_SECONDS", "300"))
 VNC_CONNECT_TIMEOUT_SECONDS = int(env("VNC_CONNECT_TIMEOUT_SECONDS", "10"))
 CLICK_DELAY_SECONDS = float(env("CLICK_DELAY_SECONDS", "1.5"))
+# navigate_to gives up after this many consecutive captures showing the SAME
+# identified screen (i.e. this many minus one ineffective clicks). 4 leaves
+# room for one slow redraw while still aborting well inside max_steps.
+NAV_STUCK_THRESHOLD = int(env("NAV_STUCK_THRESHOLD", "4"))
 METRICS_PORT = int(env("METRICS_PORT", "8080"))
 LOG_LEVEL = env("LOG_LEVEL", "INFO")
 
 SCREENSHOT_DIR = Path(__file__).parent / "screenshots"
+# In the cluster the image's rootfs is mounted READ-ONLY, so SCREENSHOT_DIR is
+# not writable and `main.py click` died on its mkdir — the click had already
+# landed, but the diagnostic screenshot was lost and the command looked like it
+# had failed. Fall back to a writable temp dir instead of dropping the evidence.
+SCREENSHOT_FALLBACK_DIR = Path(tempfile.gettempdir()) / "solarfocus-screenshots"
+
+
+def screenshot_path(name: str) -> Path:
+    """Return `name` inside the first writable screenshot directory."""
+    for base in (SCREENSHOT_DIR, SCREENSHOT_FALLBACK_DIR):
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            probe = base / ".write-test"
+            probe.touch()
+            probe.unlink()
+            return base / name
+        except OSError:
+            continue
+    return Path(tempfile.gettempdir()) / name
 
 # =============================================================================
 # Logging
@@ -669,6 +734,17 @@ m_nav_abort = Counter(
     "solarfocus_scraper_nav_abort_total",
     "navigate_to aborted after 5 consecutive unknown screens",
 )
+# Distinct from nav_abort on purpose. "Unknown screen" and "known screen that
+# will not change when clicked" are different failures with different fixes,
+# and the 2026-08-16 stall was the second one wearing the first one's clothes:
+# the walker identified the screen confidently and clicked inert pixels 12
+# times, so it logged navigate_max_steps and nothing pointed at the cause.
+m_nav_stuck = Counter(
+    "solarfocus_scraper_nav_stuck_total",
+    "navigate_to aborted because the identified screen did not change across "
+    "consecutive clicks (taps landing on inert pixels)",
+    ["screen"],
+)
 
 # =============================================================================
 # VNC helpers
@@ -695,8 +771,14 @@ def vnc_capture(client, save_path: Optional[Path] = None) -> Image.Image:
     if img is None:
         raise RuntimeError("vnc client returned no screen")
     if save_path:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        img.save(save_path)
+        try:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            img.save(save_path)
+        except OSError as e:
+            # A screenshot is a diagnostic nicety; never fail a capture that
+            # already succeeded because the filesystem is read-only.
+            event(logging.WARNING, "screenshot_save_failed",
+                  "could not write screenshot", path=str(save_path), error=str(e))
     return img
 
 def vnc_click(client, x: int, y: int) -> None:
@@ -831,37 +913,243 @@ def saugaustragung_mode(img: Image.Image) -> Optional[str]:
         return "MAN"
     return None
 
-def looks_like_info_modal(img: Image.Image) -> bool:
-    """True if `img` is one of the heater's info-type alert dialogs (blue "i"
-    icon on a white full-screen dialog), regardless of the body text.
+@dataclass(frozen=True)
+class InfoModal:
+    """A detected info-modal and how to get out of it.
 
-    Shape-based, not hash-based, so it survives the per-alert text variation
-    that broke the alert_modal hash. Used by `_identify_screen` as a last-resort
-    fallback so any info modal is recognised and dismissed rather than aborting
-    navigation as an unknown screen. See INFO_MODAL_* constants for the checks."""
+    `icon_box` is where the blue "i" icon was actually found (x, y, w, h) —
+    layout variants put it at different offsets, so this is the anchor every
+    other measurement is relative to. `dismiss_xy` is a tap that leaves the
+    dialog WITHOUT changing heater state, or None when the dialog offers no
+    unambiguous one (see the INFO_MODAL_* dismiss-geometry comment)."""
+    icon_box: tuple[int, int, int, int]
+    dismiss_xy: Optional[tuple[int, int]] = None
+    dismiss_via: Optional[str] = None   # "back_arrow" | "ok_button"
+
+
+def _px_white(p) -> bool:
+    r, g, b = p[:3]
+    return r > 200 and g > 200 and b > 200
+
+def _px_icon_blue(p) -> bool:
+    """The saturated blue of the info "i" disc."""
+    r, g, b = p[:3]
+    return b > 120 and b - r > 60 and b - g > 40
+
+def _px_navy(p) -> bool:
+    """Dark navy of the modal's back-arrow button — deliberately distinct from
+    the bright blue of the action buttons (`_px_button_blue`)."""
+    r, g, b = p[:3]
+    return b > 45 and r < 110 and g < 125 and b - r > 25 and b >= g
+
+def _px_button_blue(p) -> bool:
+    """Bright blue of a Solarfocus push-button face."""
+    r, g, b = p[:3]
+    return b > 150 and b - r > 70 and b > g
+
+def _px_arrow_yellow(p) -> bool:
+    """Yellow/amber of the back-arrow glyph."""
+    r, g, b = p[:3]
+    return r > 150 and g > 110 and b < 110 and r - b > 70
+
+
+def _info_modal_icon_candidates(px, max_candidates: int = 12) -> list[tuple[int, int, int]]:
+    """Scan INFO_MODAL_SCAN_BAND for icon-sized windows holding at least
+    INFO_MODAL_ICON_BLUE_MIN strongly-blue pixels.
+
+    Returns (blue_count, x, y) sorted strongest-first, with overlapping windows
+    suppressed so each entry is a distinct blob rather than 40 shifted views of
+    the same one. A 2-D prefix sum makes every window an O(1) lookup, which is
+    what keeps this affordable in pure Python on every capture."""
+    bx0, by0, bx1, by1 = INFO_MODAL_SCAN_BAND
+    w, h = bx1 - bx0, by1 - by0
+    iw, ih = INFO_MODAL_ICON_W, INFO_MODAL_ICON_H
+    if w < iw or h < ih:
+        return []
+    ps = [[0] * (w + 1) for _ in range(h + 1)]
+    for j in range(h):
+        prev, cur, run = ps[j], ps[j + 1], 0
+        y = by0 + j
+        for i in range(w):
+            if _px_icon_blue(px[bx0 + i, y]):
+                run += 1
+            cur[i + 1] = prev[i + 1] + run
+    found: list[tuple[int, int, int]] = []
+    for j in range(h - ih + 1):
+        top, bot = ps[j], ps[j + ih]
+        for i in range(w - iw + 1):
+            c = bot[i + iw] - top[i + iw] - bot[i] + top[i]
+            if c >= INFO_MODAL_ICON_BLUE_MIN:
+                found.append((c, bx0 + i, by0 + j))
+    found.sort(reverse=True)
+    kept: list[tuple[int, int, int]] = []
+    for c, x, y in found:
+        if any(abs(x - kx) < iw and abs(y - ky) < ih for _, kx, ky in kept):
+            continue
+        kept.append((c, x, y))
+        if len(kept) >= max_candidates:
+            break
+    return kept
+
+
+def _info_modal_anchor_ok(px, blue: int, ax: int, ay: int, width: int, height: int) -> bool:
+    """Validate an icon candidate anchored at (ax, ay) — shape, then the white
+    dialog around it, all measured relative to the anchor."""
+    iw, ih = INFO_MODAL_ICON_W, INFO_MODAL_ICON_H
+    fill = blue / float(iw * ih)
+    if not (INFO_MODAL_ICON_FILL_MIN <= fill <= INFO_MODAL_ICON_FILL_MAX):
+        return False
+    cy = ay + ih // 2
+    if not (0 <= cy < height):
+        return False
+    for dx in INFO_MODAL_MARGIN_DX:
+        left, right = ax - dx, ax + iw + dx
+        if left < 0 or right >= width:
+            return False
+        if not (_px_white(px[left, cy]) and _px_white(px[right, cy])):
+            return False
+    d0, d1, step = INFO_MODAL_BODY_DY
+    white = total = 0
+    for dy in range(d0, d1, step):
+        y = cy + dy
+        if y >= height:
+            break
+        for x in range(8, width, INFO_MODAL_BODY_DX_STEP):
+            total += 1
+            if _px_white(px[x, y]):
+                white += 1
+    if total == 0:
+        return False
+    return white / total >= INFO_MODAL_BODY_WHITE_MIN
+
+
+def _find_modal_back_arrow(px, ax: int, ay: int, width: int,
+                           height: int) -> Optional[tuple[int, int]]:
+    """Locate the modal's own back-arrow button: a yellow curved arrow on a
+    dark-navy rounded button, drawn top-left INSIDE the dialog.
+
+    The search box is pinned well left of the icon and level with it, so the
+    bottom action buttons — which also carry yellow glyphs, e.g. the warning
+    triangle on "Lagerraum befüllt" — are structurally out of reach."""
+    x_max = ax - 100
+    if x_max <= 0:
+        return None
+    y0 = max(0, ay - 40)
+    y1 = min(height - 1, ay + INFO_MODAL_ICON_H + 60)
+    xs: list[int] = []
+    ys: list[int] = []
+    for y in range(y0, y1 + 1):
+        for x in range(0, x_max):
+            if _px_arrow_yellow(px[x, y]):
+                xs.append(x)
+                ys.append(y)
+    if len(xs) < INFO_MODAL_BACK_ARROW_MIN_YELLOW:
+        return None
+    bx0, bx1 = min(xs), max(xs)
+    by0, by1 = min(ys), max(ys)
+    # A compact glyph, not scattered yellow noise spread across the dialog.
+    if not (12 <= bx1 - bx0 <= 90 and 12 <= by1 - by0 <= 90):
+        return None
+    # ...sitting on a navy button: sample the frame the glyph is drawn on.
+    fx0, fy0 = max(0, bx0 - 12), max(0, by0 - 12)
+    fx1, fy1 = min(width - 1, bx1 + 12), min(height - 1, by1 + 12)
+    navy = total = 0
+    for y in range(fy0, fy1 + 1, 2):
+        for x in range(fx0, fx1 + 1, 2):
+            total += 1
+            if _px_navy(px[x, y]):
+                navy += 1
+    if total == 0 or navy / total < INFO_MODAL_BACK_ARROW_NAVY_MIN:
+        return None
+    return ((bx0 + bx1) // 2, (by0 + by1) // 2)
+
+
+def _find_modal_ok_button(px, ax: int, ay: int, width: int,
+                          height: int) -> Optional[tuple[int, int]]:
+    """Locate a SINGLE centred bright-blue OK button below the icon.
+
+    Returns None when the dialog's button row holds more than one button: those
+    are action buttons, and picking one to escape could change heater state.
+    Refusing is the safe answer — the caller escalates instead of guessing."""
+    y_start = ay + INFO_MODAL_ICON_H + 60
+    best_y = -1
+    best_span = 0
+    best_runs: list[tuple[int, int]] = []
+    for y in range(y_start, height):
+        runs: list[tuple[int, int]] = []
+        start: Optional[int] = None
+        for x in range(width):
+            if _px_button_blue(px[x, y]):
+                if start is None:
+                    start = x
+            elif start is not None:
+                if x - start >= INFO_MODAL_OK_MIN_RUN_PX:
+                    runs.append((start, x - 1))
+                start = None
+        if start is not None and width - start >= INFO_MODAL_OK_MIN_RUN_PX:
+            runs.append((start, width - 1))
+        span = sum(b - a for a, b in runs)
+        if runs and span > best_span:
+            best_span, best_y, best_runs = span, y, runs
+    if len(best_runs) != 1:
+        return None
+    rx0, rx1 = best_runs[0]
+    cx = (rx0 + rx1) // 2
+    if abs(cx - width // 2) > INFO_MODAL_OK_MAX_OFF_CENTRE:
+        return None
+    # Vertical extent: rows whose blue run still covers most of the button.
+    need = max(1, (rx1 - rx0) // 2)
+    top = bot = best_y
+    for y in range(max(0, best_y - 80), min(height, best_y + 80)):
+        c = sum(1 for x in range(rx0, rx1 + 1) if _px_button_blue(px[x, y]))
+        if c >= need:
+            top = min(top, y)
+            bot = max(bot, y)
+    return (cx, (top + bot) // 2)
+
+
+_INFO_MODAL_CACHE_ATTR = "_solarfocus_info_modal"
+
+def find_info_modal(img: Image.Image) -> Optional[InfoModal]:
+    """Detect an info-type alert dialog and work out how to leave it safely.
+
+    Shape-based and offset-tolerant: any layout variant that draws the blue "i"
+    on a white dialog is caught, wherever the dialog sits on the display. The
+    result is memoised on the Image (each cycle captures a fresh one), because
+    `_identify_screen` and the dismiss path both need it."""
+    cached = getattr(img, _INFO_MODAL_CACHE_ATTR, False)
+    if cached is not False:
+        return cached
     rgb = img.convert("RGB")
     px = rgb.load()
+    width, height = rgb.size
+    result: Optional[InfoModal] = None
+    for blue, ax, ay in _info_modal_icon_candidates(px):
+        if not _info_modal_anchor_ok(px, blue, ax, ay, width, height):
+            continue
+        xy = _find_modal_back_arrow(px, ax, ay, width, height)
+        via: Optional[str] = "back_arrow" if xy else None
+        if xy is None:
+            xy = _find_modal_ok_button(px, ax, ay, width, height)
+            via = "ok_button" if xy else None
+        result = InfoModal(icon_box=(ax, ay, INFO_MODAL_ICON_W, INFO_MODAL_ICON_H),
+                           dismiss_xy=xy, dismiss_via=via)
+        break
+    try:
+        setattr(img, _INFO_MODAL_CACHE_ATTR, result)
+    except (AttributeError, TypeError):   # pragma: no cover - exotic Image impls
+        pass
+    return result
 
-    def is_white(xy: tuple[int, int]) -> bool:
-        r, g, b = px[xy[0], xy[1]][:3]
-        return r > 200 and g > 200 and b > 200
 
-    # 1. white dialog background (data screens are grey)
-    white_bg = sum(1 for xy in INFO_MODAL_BG_SAMPLE_XY if is_white(xy))
-    if white_bg < INFO_MODAL_BG_WHITE_MIN:
-        return False
-    # 2. white margins beside the icon (rejects full-width blue title bars)
-    if not (is_white(INFO_MODAL_LEFT_XY) and is_white(INFO_MODAL_RIGHT_XY)):
-        return False
-    # 3. a compact blue circle inside the tight top-centre icon box
-    x0, y0, w, h = INFO_MODAL_ICON_BOX
-    blue = 0
-    for y in range(y0, y0 + h):
-        for x in range(x0, x0 + w):
-            r, g, b = px[x, y][:3]
-            if b > 120 and b - r > 60 and b - g > 40:
-                blue += 1
-    return blue >= INFO_MODAL_ICON_BLUE_MIN
+def looks_like_info_modal(img: Image.Image) -> bool:
+    """True if `img` is one of the heater's info-type alert dialogs (blue "i"
+    icon on a white dialog), regardless of body text OR dialog offset.
+
+    Kept as a boolean predicate because detection and dismissability are
+    separate questions: a modal we cannot safely dismiss is still a modal, and
+    must still take precedence over whatever is drawn underneath it."""
+    return find_info_modal(img) is not None
 
 # =============================================================================
 # Template-matching OCR (deterministic, CPU-independent)
@@ -1935,7 +2223,10 @@ class _MaintenanceAbort(Exception):
 def _identify_screen(img: Image.Image) -> Optional[str]:
     """Return the name of the matching known screen, or None.
 
-    Two-stage match:
+    Three-stage match:
+      0. Overlay — an info-type alert modal, detected by icon shape. Runs
+         FIRST because a modal covers the screen underneath, whose fingerprint
+         may still match through it (see the comment on the check itself).
       1. Fast path — exact SHA256 of `hash_region`. Zero-cost but brittle; any
          VNC compression jitter or firmware-driven pixel shift invalidates it.
       2. Fallback — OCR `ocr_region` (defaults to `hash_region`) and look for
@@ -1946,6 +2237,19 @@ def _identify_screen(img: Image.Image) -> Optional[str]:
     When the OCR path matches but the hash didn't, log the drifted hash at
     WARNING so the operator can refresh `expected_hash` in source (self-heal).
     """
+    # Stage 0 — OVERLAY FIRST. An info modal is drawn OVER whatever screen was
+    # showing, and on the inset variant the host screen's title bar survives
+    # underneath it. Checking the modal last therefore loses: on 2026-08-16 the
+    # PELLETSMANGEL dialog was drawn over Saugaustragung, whose title-bar
+    # hash_region (220,2,220,28) was still pixel-identical, so the hash fast
+    # path matched and returned "saugaustragung" before the modal check ever
+    # ran. navigate_to then clicked saugaustragung's back arrow — a coordinate
+    # covered by the dialog — 12 times, logged navigate_max_steps rather than
+    # navigate_unknown_abort, and stalled for 3.5h with no self-recovery.
+    # Whatever is on top of the stack is what we are looking at.
+    if "alert_modal" in SCREENS and looks_like_info_modal(img):
+        m_screen_ident.labels(screen="alert_modal", via="icon").inc()
+        return "alert_modal"
     # Fast path — exact hash
     for name, screen in SCREENS.items():
         if not screen.expected_hash:
@@ -1976,16 +2280,6 @@ def _identify_screen(img: Image.Image) -> Optional[str]:
                           old_hash=screen.expected_hash,
                           ocr_text_seen=text.strip()[:120])
             return name
-    # Last-resort fallback: any info-type alert modal, matched by the blue "i"
-    # icon shape rather than an exact hash. This makes alert_modal a true
-    # catch-all — the hash fast-path only fingerprints one alert's layout, but
-    # the icon graphic is shared across all of them (KESSELREINIGUNG, WARTUNG-
-    # INSPEKTION, Pellet Mangel, ...). Without this a not-yet-hashed modal is
-    # "unknown", and the generic back-arrow recovery can't dismiss a centred
-    # OK-only dialog → navigate aborts (incident 2026-07-31).
-    if "alert_modal" in SCREENS and looks_like_info_modal(img):
-        m_screen_ident.labels(screen="alert_modal", via="icon").inc()
-        return "alert_modal"
     m_screen_unknown.inc()
     return None
 
@@ -2013,6 +2307,34 @@ def _shortest_path(start: str, end: str) -> Optional[list[str]]:
             queue.append((n, new_path))
     return None
 
+def _dismiss_xy_for(img: Image.Image, screen: str) -> Optional[tuple[int, int]]:
+    """Where to tap to leave `screen` via its back edge.
+
+    Ordinary screens use their static `back_xy`. Alert modals do NOT: the
+    dialog's position and its button set vary per variant, so the tap is
+    derived from the geometry actually detected in `img`, preferring the
+    dialog's own back arrow (pure navigation) over an acknowledge button, and
+    returning None rather than clicking an action button that could change
+    heater state."""
+    if screen != "alert_modal":
+        return SCREENS[screen].back_xy
+    modal = find_info_modal(img)
+    if modal is None:
+        # Identified as a modal a moment ago, gone now — treat as no tap.
+        return None
+    if modal.dismiss_xy is None:
+        event(logging.ERROR, "modal_no_safe_dismiss",
+              "info modal exposes neither a back arrow nor a single centred OK "
+              "button — refusing to click an action button that could change "
+              "heater state",
+              icon_box=list(modal.icon_box))
+        return None
+    event(logging.INFO, "modal_dismiss_target", "derived modal dismiss point",
+          via=modal.dismiss_via, xy=list(modal.dismiss_xy),
+          icon_box=list(modal.icon_box))
+    return modal.dismiss_xy
+
+
 def navigate_to(client, target: str, max_steps: int = 12) -> bool:
     """Drive VNC clicks until `_identify_screen()` returns `target`.
 
@@ -2028,11 +2350,23 @@ def navigate_to(client, target: str, max_steps: int = 12) -> bool:
       - streak >= 5: abort the cycle cleanly rather than flailing
         forever. Before this, navigate_to could eat a cycle indefinitely
         tapping back on a screen its templates had no word for.
+
+    Stuck-screen guard (identify keeps returning the SAME known screen):
+      the clicks are landing on inert pixels. This is a different failure from
+      "unknown screen" — recognition is working, the geometry is wrong — and it
+      is the modal-agnostic net for the whole class: on 2026-08-16 an inset
+      modal made the walker re-identify `saugaustragung` 12 times in a row
+      while tapping a back arrow the dialog covered, and the only trace was a
+      generic navigate_max_steps. After NAV_STUCK_THRESHOLD identical
+      identifications we abort with `navigate_stuck_screen` naming the screen,
+      so the next occurrence is diagnosable from logs alone.
     """
     if target not in SCREENS:
         event(logging.ERROR, "navigate_unknown_target", "no such screen", target=target)
         return False
     unknown_streak = 0
+    same_screen: Optional[str] = None
+    same_streak = 0
     for step in range(max_steps):
         img = vnc_capture(client)
         current = _identify_screen(img)
@@ -2040,6 +2374,9 @@ def navigate_to(client, target: str, max_steps: int = 12) -> bool:
             event(logging.DEBUG, "navigate_reached", "at target", target=target, steps=step)
             return True
         if current is None:
+            # Something changed (we can no longer name it), so the stuck-screen
+            # streak is broken — don't let unknowns accumulate into it.
+            same_screen, same_streak = None, 0
             unknown_streak += 1
             if unknown_streak >= 5:
                 m_nav_abort.inc()
@@ -2065,6 +2402,19 @@ def navigate_to(client, target: str, max_steps: int = 12) -> bool:
             continue
         # Identified a known screen — reset the unknown streak.
         unknown_streak = 0
+        # Stuck-screen guard: same known screen again despite having clicked.
+        if current == same_screen:
+            same_streak += 1
+        else:
+            same_screen, same_streak = current, 1
+        if same_streak >= NAV_STUCK_THRESHOLD:
+            m_nav_stuck.labels(screen=current).inc()
+            event(logging.ERROR, "navigate_stuck_screen",
+                  "identified screen unchanged across consecutive clicks — taps "
+                  "are landing on inert pixels (overlay covering the control?)",
+                  screen=current, target=target, step=step,
+                  ineffective_clicks=same_streak - 1)
+            return False
         path = _shortest_path(current, target)
         if not path or len(path) < 2:
             event(logging.ERROR, "navigate_no_path", "no route",
@@ -2075,7 +2425,13 @@ def navigate_to(client, target: str, max_steps: int = 12) -> bool:
             xy = EDGES[(current, next_screen)]
             edge = "forward"
         elif SCREENS[current].parent == next_screen:
-            xy = SCREENS[current].back_xy
+            back_xy = _dismiss_xy_for(img, current)
+            if back_xy is None:
+                event(logging.ERROR, "navigate_no_safe_back",
+                      "no safe back/dismiss tap for this screen",
+                      from_=current, to=next_screen)
+                return False
+            xy = back_xy
             edge = "back"
         else:
             event(logging.ERROR, "navigate_no_edge", "neither forward nor back edge",
@@ -2143,8 +2499,16 @@ def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
             broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/title", title, retain=True)
             broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/body", body, retain=True)
             broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/last_seen", alert["ts"], retain=True)
-        # Dismiss via OK button (back_xy on the alert_modal screen).
-        vnc_click(client, *SCREENS["alert_modal"].back_xy)
+        # Dismiss via the dialog's own geometry — its back arrow when it has
+        # one, else a single centred OK button. Never an action button: this
+        # dialog's bottom-right button is "Lagerraum befüllt".
+        xy = _dismiss_xy_for(img, "alert_modal")
+        if xy is None:
+            event(logging.ERROR, "alert_not_dismissable",
+                  "alert modal has no safe dismiss target — leaving it up",
+                  title=title)
+            break
+        vnc_click(client, *xy)
         time.sleep(CLICK_DELAY_SECONDS)
     return seen
 
@@ -2497,7 +2861,7 @@ def _ts() -> str:
 def cmd_probe(args) -> None:
     client = vnc_connect()
     try:
-        path = SCREENSHOT_DIR / f"probe-{_ts()}.png"
+        path = screenshot_path(f"probe-{_ts()}.png")
         vnc_capture(client, save_path=path)
         print(f"saved {path}")
     finally:
@@ -2508,7 +2872,7 @@ def cmd_click(args) -> None:
     try:
         vnc_click(client, args.x, args.y)
         time.sleep(CLICK_DELAY_SECONDS)
-        path = SCREENSHOT_DIR / f"click-{args.x}x{args.y}-{_ts()}.png"
+        path = screenshot_path(f"click-{args.x}x{args.y}-{_ts()}.png")
         vnc_capture(client, save_path=path)
         print(f"clicked ({args.x},{args.y}); saved {path}")
     finally:
@@ -2517,7 +2881,7 @@ def cmd_click(args) -> None:
 def cmd_explore(args) -> None:
     client = vnc_connect()
     try:
-        path = SCREENSHOT_DIR / f"explore-00-{_ts()}.png"
+        path = screenshot_path(f"explore-00-{_ts()}.png")
         vnc_capture(client, save_path=path)
         print(f"start: {path}")
         i = 1
@@ -2537,7 +2901,7 @@ def cmd_explore(args) -> None:
             label = parts[2] if len(parts) == 3 else f"step{i}"
             vnc_click(client, x, y)
             time.sleep(CLICK_DELAY_SECONDS)
-            path = SCREENSHOT_DIR / f"explore-{i:02d}-{label.replace(' ', '_')}-{_ts()}.png"
+            path = screenshot_path(f"explore-{i:02d}-{label.replace(' ', '_')}-{_ts()}.png")
             vnc_capture(client, save_path=path)
             print(f"  → {path}")
             i += 1
@@ -2582,7 +2946,7 @@ def cmd_navigate(args) -> None:
     client = vnc_connect()
     try:
         ok = navigate_to(client, args.screen)
-        path = SCREENSHOT_DIR / f"navigate-{args.screen}-{_ts()}.png"
+        path = screenshot_path(f"navigate-{args.screen}-{_ts()}.png")
         vnc_capture(client, save_path=path)
         print(f"{'ok' if ok else 'FAILED'}; saved {path}")
     finally:
@@ -2616,7 +2980,7 @@ def cmd_calibrate(args) -> None:
     region = SCREENS[name].hash_region
     h = region_hash(img, region)
     print(f"screen={name} region={region} hash={h}")
-    save_path = SCREENSHOT_DIR / f"calibrate-{name}-{_ts()}.png"
+    save_path = screenshot_path(f"calibrate-{name}-{_ts()}.png")
     img.save(save_path)
     print(f"saved {save_path}")
     print()

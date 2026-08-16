@@ -29,7 +29,7 @@ and a `/healthz` suitable for k8s liveness/readiness probes.
 - **Pellet probes (6):** `binary_sensor.solarfocus_pellet_heater_pellet_probe_1_full` … `_6_full` — one per pellet-storage zone. `on` = zone has pellets (green indicator on the heater UI), `off` = empty (red). Classified by R vs G channel sum over an 8×8 center crop of each probe square, so the read is insensitive to compression jitter and button highlight states.
 - **Controls (1):** `switch.solarfocus_pellet_heater_scraper_pause` — toggle from HA to pause VNC access when you want to use the touchscreen yourself
 - **Diagnostics (1):** `sensor.solarfocus_pellet_heater_scraper_last_run` (`device_class: timestamp`) — always-updating ISO8601 of the last completed cycle, useful for "minutes since last cycle" cards (the `scraper_status` sensor's `last_changed` is unreliable here because HA drops state-equal MQTT updates)
-- **Alerts (4):** `binary_sensor.solarfocus_pellet_heater_alert_active`, plus `sensor.*_alert_title`, `sensor.*_alert_body`, `sensor.*_alert_last_seen` — the heater pops modal alerts ("KESSELREINIGUNG EMPFOHLEN!", "Pellet Mangel", etc.) that must be dismissed with OK. The scraper detects them by hashing the info icon, OCRs the title+body, publishes to MQTT, and clicks OK. Works for any future info-type alert too.
+- **Alerts (4):** `binary_sensor.solarfocus_pellet_heater_alert_active`, plus `sensor.*_alert_title`, `sensor.*_alert_body`, `sensor.*_alert_last_seen` — the heater pops modal alerts ("KESSELREINIGUNG EMPFOHLEN!", "PELLETSMANGEL IM LAGERRAUM", etc.) that block navigation until dismissed. The scraper detects them by icon shape (offset-tolerant, so any dialog layout is caught), OCRs the title+body, publishes to MQTT, and dismisses via the dialog's own back arrow or OK button — never an action button. See [Info-modal detection and dismissal](#info-modal-detection-and-dismissal).
 
 Each sensor arrives with the right HA `device_class` (`temperature`, `duration`, `weight`) and `state_class` (`measurement` for live values, `total_increasing` for counters), so the Energy dashboard and long-term statistics work out of the box.
 
@@ -54,12 +54,29 @@ main ──► auswahlmenue ──► kundenmenue ──► betriebsstunden_p1 �
 
 `navigate_to(target)` does BFS over forward edges + back-arrow parent pointers. At every step it:
 
-1. captures the screen and identifies it by hash,
+1. captures the screen and identifies it — **overlay first** (an info modal, by icon shape), then by hash, then by OCR fallback,
 2. computes the shortest path to the target,
-3. clicks the first edge on that path (forward tap or back arrow),
+3. clicks the first edge on that path (forward tap, back arrow, or a *derived* modal-dismiss point),
 4. repeats until at target, bailing after 12 steps.
 
-On an **unknown** screen (hash doesn't match any), the state machine taps the back arrow to escape. This means a cycle recovers cleanly from whatever state the heater's touchscreen happened to be left in.
+Overlay-first matters: an inset modal leaves the host screen's title bar visible, so the host's hash still matches *through* the dialog. Checking the modal last meant the walker confidently identified the screen underneath and tapped a back arrow the dialog was covering.
+
+Two independent recoveries keep a cycle from stalling:
+
+- **Unknown screen** (nothing matched) — tap the back arrow to escape; escape-hatch after 3 consecutive unknowns, abort after 5 (`navigate_unknown_abort`).
+- **Stuck screen** (the *same known* screen after every click) — the taps are landing on inert pixels, which is a different failure with a different fix. Aborts after `NAV_STUCK_THRESHOLD` (default 4) identical identifications with a distinct `navigate_stuck_screen` event naming the screen. This is the modal-agnostic net: it catches an undismissable overlay even if the modal detector misses it entirely.
+
+### Info-modal detection and dismissal
+
+The heater draws every info alert with the same blue "i" icon on a white dialog, but in at least two layouts: **full-screen** (icon at y≈34, one centred OK button) and **inset** (drawn below the host screen's title bar, icon ≈50px lower, a back-arrow button top-left and *two* action buttons at the bottom). So detection is **anchor-relative**: scan a vertical band for an icon-sized blob of saturated blue, check its fill fraction is circle-like (a solid title bar scores ~1.0, a stray glyph <0.25), then validate white margins beside the icon and a white dialog body — all measured from wherever the icon actually was.
+
+The dismiss tap is **derived from the detected geometry**, never a fixed coordinate:
+
+1. the dialog's own **back arrow** if it has one — pure navigation, changes nothing,
+2. otherwise a **single centred OK button**,
+3. otherwise **nothing** — two or more action buttons and no back arrow is ambiguous, and the scraper refuses to guess.
+
+That refusal is load-bearing, not fastidiousness: the PELLETSMANGEL dialog's bottom-right button is *"Lagerraum befüllt"*. Clicking it to get out of the way would tell the heater the pellet store had been refilled — the scraper would be falsifying the state it exists to observe.
 
 ### OCR
 
@@ -166,6 +183,11 @@ Images are pushed to `ghcr.io/nachtschatt3n/solarfocus-scraper:latest` on every 
 | `solarfocus_scraper_last_run_timestamp_seconds` | gauge | Unix time of the last successful cycle |
 | `solarfocus_scraper_last_run_duration_seconds` | gauge | Duration of the last OK cycle |
 | `solarfocus_scraper_runs_total{status}` | counter | `status` ∈ `ok` \| `navigation_failed` \| `busy` \| `sanity_failed` \| `paused` |
+| `solarfocus_scraper_screen_identified_total{screen,via}` | counter | `via` ∈ `hash` \| `ocr` \| `icon` |
+| `solarfocus_scraper_screen_unknown_total` | counter | Captures matching no known screen |
+| `solarfocus_scraper_nav_escape_total` | counter | Escape hatch after 3 consecutive unknown screens |
+| `solarfocus_scraper_nav_abort_total` | counter | Aborted after 5 consecutive unknown screens |
+| `solarfocus_scraper_nav_stuck_total{screen}` | counter | Aborted because the identified screen never changed — inert clicks |
 
 ## Calibrating a new screen
 
