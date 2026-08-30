@@ -1,6 +1,6 @@
 vncdotool==1.2.0
 paho-mqtt==2.1.0
-Pillow==12.2.0
+Pillow==12.3.0
 # pytesseract is no longer used at runtime (main.py pipes straight to the
 # tesseract binary — see _tesseract()). Kept as the reference oracle that
 # tests/test_ocr_no_tempfiles.py diffs the stdin/stdout path against.
