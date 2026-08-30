@@ -90,13 +90,13 @@ SCREENS: dict[str, Screen] = {
     ),
     "auswahlmenue": Screen(
         hash_region=(85, 5, 200, 30),  # header bar text
-        expected_hash="8eafa7385c46000fc4014b764997f67d16e4cf129b1bdb594629fb9f6b886127",
+        expected_hash="420b8d677a88f5868bb1e18a021857ddb2ad73283ee9a57acac9a886cb08299d",
         parent="main",
         ocr_text="Auswahl",  # "Auswahlmenü" — umlaut-tolerant substring
     ),
     "kundenmenue": Screen(
         hash_region=(85, 5, 200, 30),
-        expected_hash="40ea3e44dd414dc6c253b19c4688355d32a8e9f89b20066841c0b6ab912e72be",
+        expected_hash="1e1ff73b4be210f3bc7998a69f1b3e9605c6c0dffb0f879f7fd3ffdec26abdaf",
         parent="auswahlmenue",
         ocr_text="Kunden",  # "Kundenmenü"
     ),
@@ -114,7 +114,7 @@ SCREENS: dict[str, Screen] = {
     ),
     "betriebsstunden_p3": Screen(
         hash_region=(85, 5, 470, 30),  # "Betriebsstundenzähler Wärmeverteilung" header
-        expected_hash="138044077cbb779fd5d703deedd64c4a742dfa184e79042c2d5ce0919c18bb38",
+        expected_hash="ac5029cc4aea6d21720a014609bcbba0dd08ea78c04479b1efce838028f4b3d1",
         parent="kundenmenue",
         # Persistent alert banners ("Pelletsmangel im Lagerraum!" etc.) can
         # overwrite the header text, which breaks the hash and makes the
@@ -726,7 +726,12 @@ m_runs = Counter("solarfocus_scraper_runs_total", "Cycles by status", ["status"]
 m_screen_ident = Counter(
     "solarfocus_scraper_screen_identified_total",
     "Screens identified by the recognizer, split by detection method",
-    ["screen", "via"],  # via: "hash" | "ocr"
+    ["screen", "via"],  # via: "hash" | "ocr" | "icon"
+)
+m_screen_hash_adopted = Counter(
+    "solarfocus_scraper_screen_hash_adopted_total",
+    "OCR-confirmed hash_region fingerprints adopted at runtime for a screen",
+    ["screen"],
 )
 m_screen_unknown = Counter(
     "solarfocus_scraper_screen_unknown_total",
@@ -2269,6 +2274,95 @@ class _NavFail(Exception):
         super().__init__(f"could not reach {screen}")
 
 
+# -----------------------------------------------------------------------------
+# Runtime hash adoption — why `expected_hash` is a SEED, not a source of truth.
+# -----------------------------------------------------------------------------
+# The hash fast-path used to be pinned exclusively by the `expected_hash`
+# constants below, refreshed by hand via `main.py calibrate`. That design has a
+# structural flaw that bit us twice:
+#
+#   `cmd_calibrate` takes ONE capture, hashes it, and prints a constant to paste
+#   into source. Nothing verifies the capture was a settled, representative
+#   frame. A single torn/mid-redraw VNC framebuffer therefore becomes a
+#   PERMANENT constant, and the only feedback is a WARNING logged on every
+#   identification, forever — which reads like "drift" and invites another blind
+#   re-paste.
+#
+# That is exactly what happened. Commit 3b0ddc2 (2026-08-02) "recalibrated"
+# auswahlmenue, kundenmenue and betriebsstunden_p3 and in doing so replaced
+# three CORRECT constants with three values that match nothing. Evidence
+# (2026-08-30): the live pod reports exactly ONE distinct new_hash per screen
+# over 6h — zero variance — and each equals the PRE-3b0ddc2 constant. For
+# betriebsstunden_p3 and kundenmenue that same value is also reproduced by
+# committed screenshots captured in April 2026. So these regions never drifted;
+# they are pixel-stable across four months. 3b0ddc2 did not fix drift, it
+# manufactured it, and ~14 warnings/cycle have been emitted ever since.
+#
+# Fix: stop treating a hand-pasted constant as the only truth. `expected_hash`
+# seeds a per-screen SET of accepted fingerprints; when the OCR fallback
+# positively identifies a screen whose hash is unknown, that hash is adopted
+# after N *consecutive identical* observations and the fast path picks it up
+# from then on. A torn frame does not repeat identically, so it is never
+# adopted — the same "N confirming cycles" idiom the sanity layer already uses
+# for delta-exceed. A genuine firmware re-render self-heals in two
+# identifications with no human, and adoption is logged ONCE at INFO instead of
+# a WARNING every cycle.
+HASH_ADOPT_CONFIRMATIONS = 2
+# Cap per screen so a genuinely unstable region cannot grow the set without
+# bound; oldest adopted entry is evicted (the seed is never evicted).
+HASH_ADOPT_MAX = 4
+
+_accepted_hashes: dict[str, list[str]] = {}
+_hash_candidate: dict[str, tuple[str, int]] = {}
+
+def accepted_hashes(name: str) -> list[str]:
+    """Fingerprints currently accepted for `name` (seed + runtime-adopted)."""
+    if name not in _accepted_hashes:
+        seed = SCREENS[name].expected_hash
+        _accepted_hashes[name] = [seed] if seed else []
+    return _accepted_hashes[name]
+
+def _note_hash_candidate(name: str, new_hash: str) -> None:
+    """Record an OCR-confirmed hash for `name`; adopt once it repeats.
+
+    Called only after OCR has positively matched the screen, so identity is
+    already established by the same authority the fallback path trusts. Two
+    guards keep adoption from making recognition WORSE than OCR alone:
+
+      * a hash already accepted for a DIFFERENT screen is never adopted.
+        auswahlmenue and kundenmenue share hash_region (85,5,200,30), so
+        without this a cross-adoption would make the fast path confidently
+        return the wrong screen;
+      * adoption requires HASH_ADOPT_CONFIRMATIONS consecutive identical
+        observations, so a one-off torn framebuffer is discarded.
+    """
+    for other, hashes in _accepted_hashes.items():
+        if other != name and new_hash in hashes:
+            event(logging.DEBUG, "screen_hash_adopt_skipped",
+                  "hash already accepted for another screen — not adopting",
+                  screen=name, other_screen=other, new_hash=new_hash)
+            _hash_candidate.pop(name, None)
+            return
+
+    prev, count = _hash_candidate.get(name, ("", 0))
+    count = count + 1 if prev == new_hash else 1
+    _hash_candidate[name] = (new_hash, count)
+    if count < HASH_ADOPT_CONFIRMATIONS:
+        return
+
+    hashes = accepted_hashes(name)
+    hashes.append(new_hash)
+    # Evict oldest ADOPTED entry (index 0 is the seed) once over the cap.
+    while len(hashes) > HASH_ADOPT_MAX:
+        del hashes[1 if len(hashes) > 1 else 0]
+    _hash_candidate.pop(name, None)
+    m_screen_hash_adopted.labels(screen=name).inc()
+    event(logging.INFO, "screen_hash_adopted",
+          "adopted OCR-confirmed hash for screen fast-path",
+          screen=name, new_hash=new_hash,
+          seed_hash=SCREENS[name].expected_hash,
+          confirmations=HASH_ADOPT_CONFIRMATIONS)
+
 class _MaintenanceAbort(Exception):
     """Raised mid-cycle when the user hits Stop on the status page. The outer
     try/finally in run_cycle disconnects VNC immediately, freeing the single
@@ -2283,15 +2377,19 @@ def _identify_screen(img: Image.Image) -> Optional[str]:
       0. Overlay — an info-type alert modal, detected by icon shape. Runs
          FIRST because a modal covers the screen underneath, whose fingerprint
          may still match through it (see the comment on the check itself).
-      1. Fast path — exact SHA256 of `hash_region`. Zero-cost but brittle; any
-         VNC compression jitter or firmware-driven pixel shift invalidates it.
+      1. Fast path — SHA256 of `hash_region` against the screen's ACCEPTED set
+         (the `expected_hash` seed plus any runtime-adopted fingerprints).
+         Zero-cost; no longer brittle, because stage 2 can extend the set.
       2. Fallback — OCR `ocr_region` (defaults to `hash_region`) and look for
          `ocr_text` as a case-insensitive substring. Used to be the source of
          the "unknown screen, tapping back" incident: hash had drifted on a
          perfectly-normal screen and we kept blindly tapping back forever.
 
-    When the OCR path matches but the hash didn't, log the drifted hash at
-    WARNING so the operator can refresh `expected_hash` in source (self-heal).
+    When the OCR path matches but the hash is unrecognized, the hash is fed to
+    `_note_hash_candidate`, which adopts it after it repeats. Recognition
+    therefore self-heals instead of requiring an operator to re-pin constants;
+    see the HASH_ADOPT_CONFIRMATIONS block above for the incident history that
+    forced this design.
     """
     # Stage 0 — OVERLAY FIRST. An info modal is drawn OVER whatever screen was
     # showing, and on the inset variant the host screen's title bar survives
@@ -2310,7 +2408,7 @@ def _identify_screen(img: Image.Image) -> Optional[str]:
     for name, screen in SCREENS.items():
         if not screen.expected_hash:
             continue
-        if region_hash(img, screen.hash_region) == screen.expected_hash:
+        if region_hash(img, screen.hash_region) in accepted_hashes(name):
             m_screen_ident.labels(screen=name, via="hash").inc()
             return name
     # Fallback — OCR title/distinctive text for screens that opted in.
@@ -2328,13 +2426,17 @@ def _identify_screen(img: Image.Image) -> Optional[str]:
             m_screen_ident.labels(screen=name, via="ocr").inc()
             if screen.expected_hash:
                 new_hash = region_hash(img, screen.hash_region)
-                if new_hash != screen.expected_hash:
-                    event(logging.WARNING, "screen_hash_drift",
-                          "OCR matched but hash differs — update expected_hash in main.py",
+                if new_hash not in accepted_hashes(name):
+                    # Not a WARNING and not an operator action item: the fast
+                    # path self-heals via _note_hash_candidate once this hash
+                    # repeats. Kept at DEBUG purely for forensics.
+                    event(logging.DEBUG, "screen_hash_unrecognized",
+                          "OCR matched but hash not yet accepted — pending adoption",
                           screen=name,
                           new_hash=new_hash,
-                          old_hash=screen.expected_hash,
+                          seed_hash=screen.expected_hash,
                           ocr_text_seen=text.strip()[:120])
+                    _note_hash_candidate(name, new_hash)
             return name
     m_screen_unknown.inc()
     return None
@@ -3022,20 +3124,51 @@ def cmd_screens(args) -> None:
 def cmd_calibrate(args) -> None:
     """Capture current screen, hash the configured region, write to SCREENS[name].expected_hash.
 
-    Use after navigating to a screen via `navigate` or `explore`. Edits main.py in-place.
-    """
-    client = vnc_connect()
-    try:
-        img = vnc_capture(client)
-    finally:
-        client.disconnect()
+    Use after navigating to a screen via `navigate` or `explore`.
 
+    Takes SEVERAL captures and refuses to emit a constant unless they all
+    agree, and unless the screen's own `ocr_text` is actually visible. The
+    single-capture version of this command is how three wrong constants got
+    pasted into source in 3b0ddc2 and produced ~14 bogus "drift" warnings per
+    cycle for a month: one torn mid-redraw framebuffer is indistinguishable
+    from a settled one when you only look once.
+    """
     name = args.screen
     if name not in SCREENS:
         sys.exit(f"unknown screen: {name}. Add it to SCREENS first.")
-    region = SCREENS[name].hash_region
-    h = region_hash(img, region)
-    print(f"screen={name} region={region} hash={h}")
+    screen = SCREENS[name]
+    region = screen.hash_region
+
+    shots = max(2, int(getattr(args, "samples", 3)))
+    client = vnc_connect()
+    imgs = []
+    try:
+        for i in range(shots):
+            if i:
+                time.sleep(1.0)
+            imgs.append(vnc_capture(client))
+    finally:
+        client.disconnect()
+
+    hashes = [region_hash(im, region) for im in imgs]
+    img = imgs[-1]
+    if len(set(hashes)) != 1:
+        sys.exit(
+            f"UNSTABLE: {shots} captures of {name} {region} produced "
+            f"{len(set(hashes))} different hashes: {sorted(set(hashes))}\n"
+            "Refusing to emit a constant. Either the region contains something "
+            "time-varying (pick a static sub-region), or the screen had not "
+            "settled. Do NOT paste any of these."
+        )
+    if screen.ocr_text:
+        seen = ocr(img, screen.ocr_region or region, FIELD_TEXT, lang="deu")
+        if screen.ocr_text.lower() not in seen.lower():
+            sys.exit(
+                f"WRONG SCREEN: expected ocr_text {screen.ocr_text!r} but OCR "
+                f"read {seen.strip()[:120]!r}. Refusing to emit a constant."
+            )
+    h = hashes[0]
+    print(f"screen={name} region={region} hash={h}  ({shots} captures agree)")
     save_path = screenshot_path(f"calibrate-{name}-{_ts()}.png")
     img.save(save_path)
     print(f"saved {save_path}")
@@ -3151,6 +3284,8 @@ def main() -> None:
 
     pcal = sub.add_parser("calibrate", help="capture current screen, print hash for paste")
     pcal.add_argument("screen", help="screen name (must already exist in SCREENS)")
+    pcal.add_argument("--samples", type=int, default=3,
+                      help="captures that must agree before a hash is emitted (min 2)")
     pcal.set_defaults(func=cmd_calibrate)
 
     plt = sub.add_parser("learn-templates",

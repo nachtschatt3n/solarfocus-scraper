@@ -281,6 +281,104 @@ def test_navigate_stuck_screen_guard_would_have_caught_the_incident():
     assert len(clicks) < 12, "must not exhaust max_steps"
 
 
+# ---------------------------------------------------------------------------
+# Runtime hash adoption (self-healing screen fingerprints).
+#
+# Guards the fix for the recurring `screen_hash_drift` warning storm. Root
+# cause was NOT drift: commit 3b0ddc2 pasted three constants captured from a
+# single unverified frame, replacing three correct ones, and the code could
+# only complain about it forever. These tests pin the properties that make a
+# hand-pasted constant non-load-bearing.
+# ---------------------------------------------------------------------------
+
+def _reset_adoption():
+    m._accepted_hashes.clear()
+    m._hash_candidate.clear()
+
+
+def test_seed_hash_is_accepted():
+    _reset_adoption()
+    seed = m.SCREENS["kessel"].expected_hash
+    assert seed in m.accepted_hashes("kessel")
+
+
+def test_hash_adopted_only_after_repeat_confirmation():
+    """One observation must NOT adopt — that is exactly the torn-framebuffer
+    case that poisoned the constants in the first place."""
+    _reset_adoption()
+    h = "a" * 64
+    m._note_hash_candidate("kessel", h)
+    assert h not in m.accepted_hashes("kessel"), \
+        "a single observation must never be adopted"
+    m._note_hash_candidate("kessel", h)
+    assert h in m.accepted_hashes("kessel"), \
+        f"should adopt after {m.HASH_ADOPT_CONFIRMATIONS} consecutive observations"
+    # Seed survives adoption.
+    assert m.SCREENS["kessel"].expected_hash in m.accepted_hashes("kessel")
+
+
+def test_non_consecutive_observations_never_adopt():
+    """A flapping region must not accumulate its way into the accepted set."""
+    _reset_adoption()
+    a, b = "a" * 64, "b" * 64
+    for _ in range(10):
+        m._note_hash_candidate("kessel", a)
+        m._note_hash_candidate("kessel", b)
+        m._note_hash_candidate("kessel", "c" * 64)
+    acc = m.accepted_hashes("kessel")
+    assert a not in acc and b not in acc, \
+        f"alternating hashes must not be adopted, got {acc}"
+
+
+def test_never_adopts_a_hash_owned_by_another_screen():
+    """auswahlmenue and kundenmenue SHARE hash_region (85,5,200,30). Adopting
+    one another's fingerprint would make the fast path confidently return the
+    wrong screen — strictly worse than the OCR fallback it bypasses."""
+    _reset_adoption()
+    assert m.SCREENS["auswahlmenue"].hash_region == m.SCREENS["kundenmenue"].hash_region, \
+        "precondition: these two screens share a hash region"
+    victim = m.SCREENS["auswahlmenue"].expected_hash
+    m.accepted_hashes("auswahlmenue")  # materialise the seed
+    for _ in range(5):
+        m._note_hash_candidate("kundenmenue", victim)
+    assert victim not in m.accepted_hashes("kundenmenue"), \
+        "cross-screen hash adoption must be refused"
+
+
+def test_accepted_set_is_capped_and_seed_is_never_evicted():
+    _reset_adoption()
+    seed = m.SCREENS["kessel"].expected_hash
+    for i in range(m.HASH_ADOPT_MAX + 5):
+        h = f"{i:064d}"
+        for _ in range(m.HASH_ADOPT_CONFIRMATIONS):
+            m._note_hash_candidate("kessel", h)
+    acc = m.accepted_hashes("kessel")
+    assert len(acc) <= m.HASH_ADOPT_MAX, f"set grew unbounded: {len(acc)}"
+    assert acc[0] == seed, "seed hash must never be evicted"
+
+
+def test_pinned_constants_match_the_live_screens():
+    """The three screens that warned every cycle must now match their pinned
+    constant on a real capture. Values verified 2026-08-30 against the live pod
+    (one distinct hash each over 6h) and, for these fixtures, against captures
+    taken four months earlier — the regions are pixel-stable, they never drifted.
+    """
+    _reset_adoption()
+    cases = [
+        ("betriebsstunden_p3", "docs/screenshots/screen-betriebsstunden-p3.png"),
+        ("kundenmenue", "screenshots/navigate-kundenmenue-20260423-100439.png"),
+    ]
+    for name, rel in cases:
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        img = Image.open(path)
+        got = m.region_hash(img, m.SCREENS[name].hash_region)
+        assert got == m.SCREENS[name].expected_hash, (
+            f"{name}: pinned expected_hash does not match committed capture "
+            f"{rel}\n  pinned={m.SCREENS[name].expected_hash}\n  actual={got}")
+
+
 def _run() -> int:
     failures = 0
     for name, fn in sorted(globals().items()):
