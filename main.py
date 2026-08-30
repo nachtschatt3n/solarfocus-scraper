@@ -10,6 +10,8 @@ import hashlib
 import json
 import logging
 import os
+import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -23,7 +25,6 @@ from pathlib import Path
 from typing import Optional
 
 import paho.mqtt.client as mqtt
-import pytesseract
 from dotenv import load_dotenv
 from PIL import Image
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
@@ -653,6 +654,11 @@ CLICK_DELAY_SECONDS = float(env("CLICK_DELAY_SECONDS", "1.5"))
 # identified screen (i.e. this many minus one ineffective clicks). 4 leaves
 # room for one slow redraw while still aborting well inside max_steps.
 NAV_STUCK_THRESHOLD = int(env("NAV_STUCK_THRESHOLD", "4"))
+# Tesseract is invoked directly (stdin -> stdout), not through pytesseract —
+# see _tesseract() for why. TESSERACT_CMD matches pytesseract's own env knob
+# name so an operator can point at a non-PATH binary the same way.
+TESSERACT_CMD = env("TESSERACT_CMD", "tesseract")
+OCR_TIMEOUT_SECONDS = float(env("OCR_TIMEOUT_SECONDS", "30"))
 METRICS_PORT = int(env("METRICS_PORT", "8080"))
 LOG_LEVEL = env("LOG_LEVEL", "INFO")
 
@@ -825,6 +831,56 @@ def _otsu_threshold(gray: Image.Image) -> int:
             thresh = i
     return thresh
 
+def _tesseract(img: Image.Image, lang: str, config: str) -> str:
+    """OCR `img` by piping PNG bytes to tesseract's stdin and reading stdout.
+
+    Deliberately NOT pytesseract.image_to_string. That helper round-trips every
+    single call through THREE temp files: `NamedTemporaryFile(prefix='tess_')`
+    creates `tess_XXXX`, it then writes `tess_XXXX_input.png` beside it, and
+    tesseract writes `tess_XXXX.txt` — all three created and unlinked again
+    within the call (pytesseract.save/cleanup).
+
+    That churn is what made the pod look like it was leaking memory. At ~60-70
+    OCR calls per cycle and ~185 cycles/day that is ~36k file create+unlink
+    pairs a day, and the kernel charges the resulting dentry+inode slab to the
+    container's memory cgroup. cAdvisor's working set is
+    `memory.current - inactive_file`, which *includes* `slab_reclaimable`, so
+    `container_memory_working_set_bytes` climbed ~10 MiB/day (231 MiB of a
+    256 MiB limit after 12 days) while the Python heap itself was flat:
+    measured on 2026-08-30, cgroup `anon` 96.9 MiB / `file` 11.5 MiB /
+    `slab_reclaimable` 132.8 MiB, `process_open_fds` 12 and flat,
+    `container_memory_rss` trending *down* 2.7 MiB/day. Slab is reclaimable, so
+    this was never going to OOM-kill — but it pins the pod at ~100% of its
+    limit and keeps ContainerMemoryNearLimit firing forever.
+
+    Piping through stdin/stdout creates no files at all, so there is no dentry
+    churn to cache. Output is byte-identical to pytesseract's temp-file path:
+    pytesseract.prepare() saves in-memory images as PNG unchanged, and reading
+    tesseract's `.txt` output file yields the same bytes tesseract writes to
+    stdout. tests/test_ocr_no_tempfiles.py pins both properties.
+    """
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    # `-` for imagename and outputbase = stdin/stdout. `-c` variables must come
+    # after the positional args, which shlex.split of our config strings gives.
+    argv = [TESSERACT_CMD, "-", "-", "-l", lang, *shlex.split(config)]
+    try:
+        proc = subprocess.run(
+            argv,
+            input=buf.getvalue(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=OCR_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(f"{TESSERACT_CMD} not found on PATH") from e
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"tesseract exited {proc.returncode}: "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()[:200]}")
+    return proc.stdout.decode("utf-8", "replace")
+
+
 def ocr(img: Image.Image, region: tuple[int, int, int, int], config: str,
         lang: str = "deu", invert: bool = False, lcd: bool = False) -> str:
     from PIL import ImageOps
@@ -847,7 +903,7 @@ def ocr(img: Image.Image, region: tuple[int, int, int, int], config: str,
         big = big.point(lambda p: 0 if p < t else 255, mode="L")
     else:
         big = c.resize((c.width * 2, c.height * 2), Image.LANCZOS)
-    return pytesseract.image_to_string(big, lang=lang, config=config).strip()
+    return _tesseract(big, lang=lang, config=config).strip()
 
 def parse_value(raw: str, kind: str) -> Optional[float | int | str]:
     if kind == "str":
