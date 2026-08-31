@@ -30,6 +30,10 @@ class _FakeClient:
         self.connect_calls = 0
         self.reconnect_delay_args: tuple | None = None
         self.loop_started = False
+        self.will: tuple | None = None   # LWT marks heater sensors unavailable
+
+    def will_set(self, topic, payload=None, qos=0, retain=False):
+        self.will = (topic, payload, qos, retain)
 
     def connect(self, host, port, keepalive=60):
         self.connect_calls += 1

@@ -1353,6 +1353,11 @@ class MqttBroker:
         # Mid-run drops (node reboot, broker restart): paho's loop thread
         # auto-reconnects on its own once the first connection has succeeded —
         # bound its backoff to the same cap as the initial connect.
+        # Last will: if the pod dies without a clean shutdown, the broker marks
+        # the heater sensors unavailable for us. Without this, a hard pod loss
+        # leaves 38 retained values looking like live readings forever.
+        self.client.will_set(f"{MQTT_TOPIC_PREFIX}/scraper/availability",
+                             "offline", qos=0, retain=True)
         self.client.reconnect_delay_set(
             min_delay=int(MQTT_CONNECT_BACKOFF_INITIAL_SECONDS),
             max_delay=int(MQTT_CONNECT_BACKOFF_MAX_SECONDS),
@@ -1449,6 +1454,15 @@ def publish_discovery(broker: MqttBroker) -> None:
             "unique_id": f"{MQTT_DEVICE_ID}_{field}",
             "object_id": f"{MQTT_DEVICE_ID}_{field}",
             "state_topic": f"{MQTT_TOPIC_PREFIX}/{field}",
+            # Heater readings ONLY. When a cycle cannot produce values, these go
+            # `unavailable` in HA instead of holding a stale number that looks
+            # live. Deliberately NOT applied to the scraper's own diagnostic
+            # entities below (status, last_run, alert/*): those must stay
+            # readable precisely when the heater sensors are unavailable, since
+            # they are what explain WHY.
+            "availability_topic": f"{MQTT_TOPIC_PREFIX}/scraper/availability",
+            "payload_available": "online",
+            "payload_not_available": "offline",
             "device": DEVICE_BLOCK,
         }
         if meta.unit:
@@ -2819,6 +2833,7 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
         except Exception as e:
             event(logging.WARNING, "vnc_connect_failed", "VNC connect failed (likely busy)", error=str(e))
             m_runs.labels(status="busy").inc()
+            _publish_availability(broker, dry_run, online=False)
             if broker and not dry_run:
                 broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "busy", retain=True)
             final_status, final_error = "busy", str(e)
@@ -2943,6 +2958,7 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
             event(logging.ERROR, "sanity_check_failed",
                   "all fields rejected", rejected=rejected)
             m_runs.labels(status="sanity_failed").inc()
+            _publish_availability(broker, dry_run, online=False)
             if broker and not dry_run:
                 broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "sanity_failed", retain=True)
             final_status, final_error = "sanity_failed", "all fields rejected"
@@ -2983,6 +2999,8 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
         m_last_dur.set(duration)
         result_status = "partial" if rejected else "ok"
         m_runs.labels(status=result_status).inc()
+        # A cycle that produced values is the definition of fresh data.
+        _publish_availability(broker, dry_run, online=True)
         final_status = result_status
         event(logging.INFO, "cycle_complete",
               f"cycle {result_status}", duration_s=round(duration, 2),
@@ -2990,10 +3008,25 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
         return CycleResult(status=result_status, values=values)
     except Exception as e:
         final_status, final_error = "error", str(e)
+        _publish_availability(broker, dry_run, online=False)
         event(logging.ERROR, "cycle_error", "unhandled cycle exception", error=str(e))
         raise
     finally:
         COORD.end_cycle(final_status, error=final_error)
+
+def _publish_availability(broker: Optional[MqttBroker], dry_run: bool, online: bool) -> None:
+    """Mark the HEATER sensors available/unavailable in HA.
+
+    Called only on terminal cycle outcomes that say something about data
+    freshness. Deliberately NOT called for `paused`/`maintenance`: those are
+    operator-initiated idles where the operator already knows why data stopped,
+    and scraper_status reports them. A failure the operator did not ask for is
+    exactly the case that used to freeze 38 sensors silently."""
+    if not broker or dry_run:
+        return
+    broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/availability",
+                   "online" if online else "offline", retain=True)
+
 
 def _handle_nav_fail(client, broker: Optional[MqttBroker], dry_run: bool, screen: str) -> CycleResult:
     try:
@@ -3004,6 +3037,7 @@ def _handle_nav_fail(client, broker: Optional[MqttBroker], dry_run: bool, screen
     except Exception:
         b64 = None
     m_runs.labels(status="navigation_failed").inc()
+    _publish_availability(broker, dry_run, online=False)
     if broker and not dry_run and b64:
         broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/last_error_image", b64, retain=True)
         broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "navigation_failed", retain=True)
