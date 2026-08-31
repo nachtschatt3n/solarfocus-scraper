@@ -397,15 +397,35 @@ INFO_MODAL_ICON_H = 42
 # the full-screen (34) and inset (85) variants plus headroom for further ones.
 INFO_MODAL_SCAN_BAND = (250, 15, 400, 240)
 INFO_MODAL_ICON_BLUE_MIN = 150   # candidate floor: strongly-blue px in the box
-# The icon is a filled circle inscribed in the box — ~0.54 of the box area with
-# this blue predicate. A solid blue title bar or button scores ~1.00; a stray
-# blue glyph scores <0.25. This range is what separates a circle from both, and
-# it is the check that kills every false positive in the fixture corpus.
-INFO_MODAL_ICON_FILL_MIN = 0.35
-INFO_MODAL_ICON_FILL_MAX = 0.80
+# --- Icon geometry: MEASURED, never assumed ---------------------------------
+# INFO_MODAL_ICON_W/H above size the SEED SCAN WINDOW only. They must not be
+# used as the icon's real extent: dialog variants draw the info disc at
+# different sizes (35x36 on the WARTUNG/PELLETSMANGEL dialogs, 59x60 on
+# KESSELREINIGUNG), and every geometric test that assumed a fixed 43x42 box
+# broke on the larger one. On 2026-08-31 that cost ~6h of dead scraping — the
+# KESSELREINIGUNG icon packed 1448 blue pixels into the 43x42 window for a fill
+# of 0.8017 against a 0.80 ceiling, and the right-hand margin probe at
+# ax+43+14 landed *inside* the oversized icon rather than on dialog background.
+# Both failures are the same bug: a fixed box measuring a variable object.
+#
+# So: find the icon's actual connected blob, then measure everything relative
+# to ITS edges. Nudging the 0.80 ceiling would have unblocked this one dialog
+# and left the next differently-sized one to fail as `screen_unknown`.
+INFO_MODAL_ICON_MIN_SIDE = 24
+INFO_MODAL_ICON_MAX_SIDE = 72
+# Roughly square — the disc is circular. Kills wide blue title bars (aspect
+# 5.2) and the split status strips (2.1) outright.
+INFO_MODAL_ICON_ASPECT = (0.75, 1.35)
+# Fill of the MEASURED box. A disc leaves the corners empty (observed
+# 0.405-0.670 across all three dialog variants); solid blue panels on data
+# screens score 0.86-0.97. Deliberately loose: this is a sanity bound, not the
+# discriminator. The white-margin and white-body checks below are what actually
+# separate a dialog from a data screen, and they must stay load-bearing.
+INFO_MODAL_ICON_FILL = (0.30, 0.85)
 # White margins immediately left AND right of the icon at its mid-height,
-# measured relative to the anchor. A full-width blue title bar fails both.
-INFO_MODAL_MARGIN_DX: tuple[int, ...] = (14, 19)
+# measured from the icon's MEASURED edges. A full-width blue title bar fails
+# both. These probes are the primary false-positive killer.
+INFO_MODAL_MARGIN_DX: tuple[int, ...] = (8, 14)
 # The dialog body below the icon must be predominantly white (data screens are
 # grey and busy). Coarse grid, again relative to the anchor.
 INFO_MODAL_BODY_DY = (40, 170, 10)   # start, stop, step below the icon centre
@@ -1053,18 +1073,76 @@ def _info_modal_icon_candidates(px, max_candidates: int = 12) -> list[tuple[int,
     return kept
 
 
-def _info_modal_anchor_ok(px, blue: int, ax: int, ay: int, width: int, height: int) -> bool:
-    """Validate an icon candidate anchored at (ax, ay) — shape, then the white
-    dialog around it, all measured relative to the anchor."""
+def _measure_icon_blob(px, sx: int, sy: int, width: int, height: int,
+                       cap: int = 40000) -> Optional[tuple[int, int, int, int, int]]:
+    """Measure the icon's ACTUAL extent: the connected blob of icon-blue pixels
+    reached from the centre of the seed window at (sx, sy).
+
+    Returns (x0, y0, x1, y1, pixel_count), or None if nothing blue is in the
+    window or the blob runs away (`cap`), which is what a full-screen blue wash
+    would do. Seeding from the pixel nearest the window CENTRE matters: seeding
+    from the first blue pixel in raster order latches onto an anti-aliasing
+    speck at the icon's edge and measures a 3x2 box."""
     iw, ih = INFO_MODAL_ICON_W, INFO_MODAL_ICON_H
-    fill = blue / float(iw * ih)
-    if not (INFO_MODAL_ICON_FILL_MIN <= fill <= INFO_MODAL_ICON_FILL_MAX):
+    cx, cy = sx + iw // 2, sy + ih // 2
+    seed = None
+    best_d = None
+    for y in range(sy, min(height, sy + ih)):
+        for x in range(sx, min(width, sx + iw)):
+            if _px_icon_blue(px[x, y]):
+                d = (x - cx) ** 2 + (y - cy) ** 2
+                if best_d is None or d < best_d:
+                    best_d, seed = d, (x, y)
+    if seed is None:
+        return None
+    seen = {seed}
+    stack = [seed]
+    n = 0
+    x0 = x1 = seed[0]
+    y0 = y1 = seed[1]
+    while stack:
+        x, y = stack.pop()
+        n += 1
+        if n > cap:
+            return None
+        if x < x0: x0 = x
+        if x > x1: x1 = x
+        if y < y0: y0 = y
+        if y > y1: y1 = y
+        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if 0 <= nx < width and 0 <= ny < height and (nx, ny) not in seen \
+                    and _px_icon_blue(px[nx, ny]):
+                seen.add((nx, ny))
+                stack.append((nx, ny))
+    return (x0, y0, x1, y1, n)
+
+
+def _icon_box_ok(px, box: tuple[int, int, int, int, int],
+                 width: int, height: int) -> bool:
+    """Validate a MEASURED icon blob: shape first, then the dialog around it.
+
+    Shape checks (size range, near-square aspect, disc-like fill) are sanity
+    bounds that reject blue panels and title bars structurally. The white
+    margin + white body probes are the real discriminator between a dialog and
+    a data screen, and are measured from the blob's own edges so they work at
+    any icon size."""
+    x0, y0, x1, y1, n = box
+    w, h = x1 - x0 + 1, y1 - y0 + 1
+    if not (INFO_MODAL_ICON_MIN_SIDE <= w <= INFO_MODAL_ICON_MAX_SIDE):
         return False
-    cy = ay + ih // 2
+    if not (INFO_MODAL_ICON_MIN_SIDE <= h <= INFO_MODAL_ICON_MAX_SIDE):
+        return False
+    a_lo, a_hi = INFO_MODAL_ICON_ASPECT
+    if not (a_lo <= w / float(h) <= a_hi):
+        return False
+    f_lo, f_hi = INFO_MODAL_ICON_FILL
+    if not (f_lo <= n / float(w * h) <= f_hi):
+        return False
+    cy = (y0 + y1) // 2
     if not (0 <= cy < height):
         return False
     for dx in INFO_MODAL_MARGIN_DX:
-        left, right = ax - dx, ax + iw + dx
+        left, right = x0 - dx, x1 + dx
         if left < 0 or right >= width:
             return False
         if not (_px_white(px[left, cy]) and _px_white(px[right, cy])):
@@ -1084,7 +1162,7 @@ def _info_modal_anchor_ok(px, blue: int, ax: int, ay: int, width: int, height: i
     return white / total >= INFO_MODAL_BODY_WHITE_MIN
 
 
-def _find_modal_back_arrow(px, ax: int, ay: int, width: int,
+def _find_modal_back_arrow(px, icon: tuple[int, int, int, int], width: int,
                            height: int) -> Optional[tuple[int, int]]:
     """Locate the modal's own back-arrow button: a yellow curved arrow on a
     dark-navy rounded button, drawn top-left INSIDE the dialog.
@@ -1092,11 +1170,12 @@ def _find_modal_back_arrow(px, ax: int, ay: int, width: int,
     The search box is pinned well left of the icon and level with it, so the
     bottom action buttons — which also carry yellow glyphs, e.g. the warning
     triangle on "Lagerraum befüllt" — are structurally out of reach."""
-    x_max = ax - 100
+    ix0, iy0, ix1, iy1 = icon
+    x_max = ix0 - 100
     if x_max <= 0:
         return None
-    y0 = max(0, ay - 40)
-    y1 = min(height - 1, ay + INFO_MODAL_ICON_H + 60)
+    y0 = max(0, iy0 - 40)
+    y1 = min(height - 1, iy1 + 60)
     xs: list[int] = []
     ys: list[int] = []
     for y in range(y0, y1 + 1):
@@ -1125,14 +1204,14 @@ def _find_modal_back_arrow(px, ax: int, ay: int, width: int,
     return ((bx0 + bx1) // 2, (by0 + by1) // 2)
 
 
-def _find_modal_ok_button(px, ax: int, ay: int, width: int,
+def _find_modal_ok_button(px, icon: tuple[int, int, int, int], width: int,
                           height: int) -> Optional[tuple[int, int]]:
     """Locate a SINGLE centred bright-blue OK button below the icon.
 
     Returns None when the dialog's button row holds more than one button: those
     are action buttons, and picking one to escape could change heater state.
     Refusing is the safe answer — the caller escalates instead of guessing."""
-    y_start = ay + INFO_MODAL_ICON_H + 60
+    y_start = icon[3] + 60
     best_y = -1
     best_span = 0
     best_runs: list[tuple[int, int]] = []
@@ -1185,15 +1264,25 @@ def find_info_modal(img: Image.Image) -> Optional[InfoModal]:
     px = rgb.load()
     width, height = rgb.size
     result: Optional[InfoModal] = None
-    for blue, ax, ay in _info_modal_icon_candidates(px):
-        if not _info_modal_anchor_ok(px, blue, ax, ay, width, height):
+    seen_boxes: set[tuple[int, int, int, int]] = set()
+    for _blue, ax, ay in _info_modal_icon_candidates(px):
+        blob = _measure_icon_blob(px, ax, ay, width, height)
+        if blob is None:
             continue
-        xy = _find_modal_back_arrow(px, ax, ay, width, height)
+        icon = blob[:4]
+        # Overlapping seed windows resolve to the SAME blob; measure it once.
+        if icon in seen_boxes:
+            continue
+        seen_boxes.add(icon)
+        if not _icon_box_ok(px, blob, width, height):
+            continue
+        xy = _find_modal_back_arrow(px, icon, width, height)
         via: Optional[str] = "back_arrow" if xy else None
         if xy is None:
-            xy = _find_modal_ok_button(px, ax, ay, width, height)
+            xy = _find_modal_ok_button(px, icon, width, height)
             via = "ok_button" if xy else None
-        result = InfoModal(icon_box=(ax, ay, INFO_MODAL_ICON_W, INFO_MODAL_ICON_H),
+        ix0, iy0, ix1, iy1 = icon
+        result = InfoModal(icon_box=(ix0, iy0, ix1 - ix0 + 1, iy1 - iy0 + 1),
                            dismiss_xy=xy, dismiss_via=via)
         break
     try:
@@ -1346,6 +1435,9 @@ class MqttBroker:
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
         self.pause_state: bool = False  # mirrors retained solarfocus/scraper/pause
+        # Sticky maintenance-alert latch. See ALERT LATCH note on _handle_alert_modal.
+        self.alert_latched: bool = False
+        self.alert_latch_title: str = ""
         self.last_values: dict[str, str] = {}  # field -> last retained value (string)
         self._lock = threading.Lock()
 
@@ -1406,6 +1498,8 @@ class MqttBroker:
         event(logging.INFO, "mqtt_connected", "MQTT connected", host=MQTT_HOST, port=MQTT_PORT)
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/scraper/pause")
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/scraper/pause/set")
+        client.subscribe(f"{MQTT_TOPIC_PREFIX}/alert/latched")  # restore latch after restart
+        client.subscribe(f"{MQTT_TOPIC_PREFIX}/alert/reset")    # operator "condition cleared"
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/+")  # capture retained sensor values
 
     def _on_message(self, client, userdata, msg):
@@ -1417,10 +1511,40 @@ class MqttBroker:
         elif topic == f"{MQTT_TOPIC_PREFIX}/scraper/pause/set":
             normalized = "on" if payload.strip().lower() in ("on", "true", "1") else "off"
             client.publish(f"{MQTT_TOPIC_PREFIX}/scraper/pause", normalized, qos=0, retain=True)
+        elif topic == f"{MQTT_TOPIC_PREFIX}/alert/latched":
+            # Retained — restores the latch across pod restarts, so a rollout
+            # cannot silently drop a pending maintenance prompt.
+            with self._lock:
+                self.alert_latched = payload.strip().lower() in ("on", "true", "1")
+        elif topic == f"{MQTT_TOPIC_PREFIX}/alert/reset":
+            with self._lock:
+                was, title = self.alert_latched, self.alert_latch_title
+                self.alert_latched = False
+                self.alert_latch_title = ""
+            client.publish(f"{MQTT_TOPIC_PREFIX}/alert/latched", "off", qos=0, retain=True)
+            client.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "off", qos=0, retain=True)
+            event(logging.INFO, "alert_latch_cleared",
+                  "operator cleared the maintenance-alert latch",
+                  was_latched=was, title=title)
         elif topic.startswith(f"{MQTT_TOPIC_PREFIX}/") and "/" not in topic[len(MQTT_TOPIC_PREFIX) + 1:]:
             field = topic[len(MQTT_TOPIC_PREFIX) + 1:]
             with self._lock:
                 self.last_values[field] = payload
+
+    def latch_alert(self, title: str) -> None:
+        """Mark a maintenance alert as outstanding after WE dismissed its dialog."""
+        with self._lock:
+            first, self.alert_latched = not self.alert_latched, True
+            self.alert_latch_title = title
+        self.publish(f"{MQTT_TOPIC_PREFIX}/alert/latched", "on", retain=True)
+        if first:
+            event(logging.WARNING, "alert_latched",
+                  "dismissed a maintenance alert — holding alert/active on until "
+                  "the operator confirms the condition is cleared", title=title)
+
+    def is_alert_latched(self) -> bool:
+        with self._lock:
+            return self.alert_latched
 
     def is_paused(self) -> bool:
         with self._lock:
@@ -1485,6 +1609,20 @@ def publish_discovery(broker: MqttBroker) -> None:
         "payload_off": "off",
         "state_on": "on",
         "state_off": "off",
+        "device": DEVICE_BLOCK,
+    }, retain=True)
+
+    # Maintenance-alert latch reset. Pressing this is the operator asserting
+    # "I have physically dealt with the heater's service prompt" — it is the
+    # only thing that clears alert/active once the scraper has dismissed a
+    # dialog on the panel. Without it, auto-dismissal would erase the only
+    # signal that the boiler needs servicing.
+    broker.publish(f"{MQTT_DISCOVERY_PREFIX}/button/{MQTT_DEVICE_ID}/alert_reset/config", {
+        "name": "Clear Heater Service Alert",
+        "unique_id": f"{MQTT_DEVICE_ID}_alert_reset",
+        "object_id": f"{MQTT_DEVICE_ID}_alert_reset",
+        "command_topic": f"{MQTT_TOPIC_PREFIX}/alert/reset",
+        "payload_press": "PRESS",
         "device": DEVICE_BLOCK,
     }, retain=True)
 
@@ -2680,6 +2818,21 @@ def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
                   "alert modal has no safe dismiss target — leaving it up",
                   title=title)
             break
+        # ALERT LATCH — precondition for dismissing at all.
+        #
+        # run_cycle clears alert/active as soon as a cycle sees no modal. Before
+        # the detector could see these dialogs the point was moot: we never
+        # dismissed one, so the flag tracked reality. Now that we CAN dismiss a
+        # maintenance prompt, clearing on absence would mean the scraper taps OK,
+        # the modal goes away, and HA reports no alert — while the boiler still
+        # needs the service that prompted it. That trades a visible stall for an
+        # invisible one, which is strictly worse.
+        #
+        # So dismissal latches alert/active on. Only the operator pressing the
+        # "Clear Heater Service Alert" button (alert/reset) clears it, which is
+        # them asserting the physical condition is actually dealt with.
+        if broker and not dry_run:
+            broker.latch_alert(title)
         vnc_click(client, *xy)
         time.sleep(CLICK_DELAY_SECONDS)
     return seen
@@ -2845,10 +2998,12 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
             # helper publishes each one to MQTT before dismissing.
             COORD.set_phase("alerts")
             alerts = _handle_alert_modal(client, broker, dry_run)
-            if broker and not dry_run and not alerts:
-                # No alert this cycle — clear the retained active flag so HA
-                # reflects the current state. Title/body are left retained so
-                # the last alert's text persists as reference.
+            if broker and not dry_run and not alerts and not broker.is_alert_latched():
+                # No alert this cycle AND nothing latched — clear the retained
+                # active flag so HA reflects the current state. Title/body are
+                # left retained so the last alert's text persists as reference.
+                # While latched, the flag stays on even though the dialog is
+                # gone: we are the reason it is gone.
                 broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "off", retain=True)
 
             screens_needed = sorted({spec.screen for spec in BBOXES.values()} | {"main"})

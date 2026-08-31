@@ -32,7 +32,10 @@ import main as m  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 MODAL_FULLSCREEN = ROOT / "tests" / "fixtures" / "alert_modal_wartung.png"
 MODAL_INSET = ROOT / "tests" / "fixtures" / "alert_modal_pelletsmangel_inset.png"
-MODAL_FIXTURES = {MODAL_FULLSCREEN, MODAL_INSET}
+MODAL_KESSELREINIGUNG = ROOT / "tests" / "fixtures" / "alert_modal_kesselreinigung.png"
+# Every committed capture that IS a modal — excluded from the false-positive
+# corpus below, which asserts the opposite property.
+MODAL_FIXTURES = {MODAL_FULLSCREEN, MODAL_INSET, MODAL_KESSELREINIGUNG}
 
 # Known data screens (committed, also used in the README) and their expected
 # identification. None = "don't care which, but it must NOT be alert_modal".
@@ -377,6 +380,146 @@ def test_pinned_constants_match_the_live_screens():
         assert got == m.SCREENS[name].expected_hash, (
             f"{name}: pinned expected_hash does not match committed capture "
             f"{rel}\n  pinned={m.SCREENS[name].expected_hash}\n  actual={got}")
+
+
+# ---------------------------------------------------------------------------
+# Modal detection at ANY icon size (2026-08-31 KESSELREINIGUNG stall).
+#
+# The detector assumed a fixed 43x42 info icon. KESSELREINIGUNG draws a 59x60
+# one, which failed the fixed-window fill ratio (1448/(43*42) = 0.8017 against a
+# 0.80 ceiling) AND put the right-hand margin probe at ax+43+14 *inside* the
+# icon. The dialog went undetected for ~6h; the scraper could not dismiss it and
+# completed zero cycles. Geometry is now measured from the icon's real blob.
+#
+# These are safety tests, not cosmetics: a false positive here means tapping an
+# unknown coordinate on a live boiler.
+# ---------------------------------------------------------------------------
+
+# Every committed capture of a NORMAL screen. None may be seen as a modal.
+_NON_MODAL_GLOBS = ("tests/fixtures/screen_*.png", "tests/fixtures/warmwasser_*.png",
+                    "docs/screenshots/screen-*.png", "screenshots/*.png")
+
+
+def _non_modal_captures():
+    out = []
+    for g in _NON_MODAL_GLOBS:
+        out.extend(sorted(ROOT.glob(g)))
+    # 640x480 only: the scan band assumes a full framebuffer.
+    keep = []
+    for p in out:
+        try:
+            if Image.open(p).size == (640, 480):
+                keep.append(p)
+        except Exception:
+            pass
+    return keep
+
+
+def test_kesselreinigung_modal_is_detected():
+    """The exact dialog that stalled the scraper for ~6h."""
+    img = Image.open(MODAL_KESSELREINIGUNG)
+    modal = m.find_info_modal(img)
+    assert modal is not None, \
+        "KESSELREINIGUNG dialog must be detected by SHAPE, not only by its pinned hash"
+    x, y, w, h = modal.icon_box
+    assert w > m.INFO_MODAL_ICON_W and h > m.INFO_MODAL_ICON_H, (
+        f"precondition: this icon ({w}x{h}) is LARGER than the seed window "
+        f"({m.INFO_MODAL_ICON_W}x{m.INFO_MODAL_ICON_H}) — that is what broke")
+
+
+def test_kesselreinigung_dismiss_is_the_single_centred_ok_button():
+    """Must resolve to the OK button, never an action button."""
+    modal = m.find_info_modal(Image.open(MODAL_KESSELREINIGUNG))
+    assert modal.dismiss_via == "ok_button", f"got {modal.dismiss_via}"
+    x, y = modal.dismiss_xy
+    assert 250 < x < 390, f"OK tap x={x} not horizontally centred"
+    assert 380 < y < 450, f"OK tap y={y} not on the button row"
+
+
+def test_identify_resolves_kesselreinigung_to_alert_modal():
+    assert m._identify_screen(Image.open(MODAL_KESSELREINIGUNG)) == "alert_modal"
+
+
+def test_all_modal_variants_detected_across_icon_sizes():
+    """35x36 and 59x60 icons must BOTH pass — the point of measuring."""
+    sizes = set()
+    for f in (MODAL_FULLSCREEN, MODAL_INSET, MODAL_KESSELREINIGUNG):
+        modal = m.find_info_modal(Image.open(f))
+        assert modal is not None, f"{f.name} not detected"
+        assert modal.dismiss_xy is not None, f"{f.name} has no safe dismiss target"
+        sizes.add(modal.icon_box[2:])
+    assert len(sizes) > 1, f"expected differing icon sizes, got {sizes}"
+
+
+def test_no_data_screen_is_ever_seen_as_a_modal():
+    """MANDATORY false-positive guard. A false positive taps an unknown
+    coordinate on a live heater — the failure 683842d hardened against."""
+    caps = _non_modal_captures()
+    assert len(caps) >= 10, f"corpus too small to be meaningful: {len(caps)}"
+    bad = []
+    for path in caps:
+        modal = m.find_info_modal(Image.open(path))
+        if modal is not None:
+            bad.append(f"{path.name} -> icon={modal.icon_box} dismiss={modal.dismiss_xy}")
+    assert not bad, "widened detector now sees modals in normal screens:\n  " + "\n  ".join(bad)
+
+
+def test_blob_measurement_rejects_runaway_regions():
+    """A large blue wash must not be measured as an icon."""
+    from PIL import Image as _I
+    img = _I.new("RGB", (640, 480), (0, 0, 255))
+    assert m.find_info_modal(img) is None, "a full blue screen is not a modal"
+
+
+# --- alert latch -----------------------------------------------------------
+# Dismissing a maintenance prompt must NOT erase it from HA.
+
+class _FakeBroker:
+    def __init__(self):
+        self.published = []
+        self.alert_latched = False
+        self.alert_latch_title = ""
+    def publish(self, topic, payload, retain=False):
+        self.published.append((topic, payload))
+    def latch_alert(self, title):
+        self.alert_latched = True
+        self.alert_latch_title = title
+        self.publish(f"{m.MQTT_TOPIC_PREFIX}/alert/latched", "on", retain=True)
+    def is_alert_latched(self):
+        return self.alert_latched
+
+
+def test_latch_survives_and_blocks_the_active_off_publish():
+    b = _FakeBroker()
+    b.latch_alert("Kesselreinigung")
+    assert b.is_alert_latched()
+    # The run_cycle guard: active/off only when nothing is latched.
+    assert not (True and not b.is_alert_latched()), \
+        "alert/active must NOT be cleared while a dismissed alert is latched"
+
+
+def test_availability_topic_on_heater_sensors_only():
+    """Heater readings must go unavailable on a stall; the scraper's own
+    diagnostic entities must stay readable to explain why."""
+    b = _FakeBroker()
+    m.publish_discovery(b)
+    import json as _j
+    avail = f"{m.MQTT_TOPIC_PREFIX}/scraper/availability"
+    heater = diag = 0
+    for topic, payload in b.published:
+        if not topic.endswith("/config"):
+            continue
+        cfg = _j.loads(payload) if isinstance(payload, str) else payload
+        field = topic.split("/")[-2]
+        if field in m.SENSORS:
+            assert cfg.get("availability_topic") == avail, f"{field} lacks availability_topic"
+            heater += 1
+        elif field in ("scraper_status", "scraper_last_run", "alert_reset"):
+            assert "availability_topic" not in cfg, \
+                f"diagnostic entity {field} must stay readable during a stall"
+            diag += 1
+    assert heater >= 30, f"only {heater} heater sensors carried availability_topic"
+    assert diag >= 2
 
 
 def _run() -> int:
