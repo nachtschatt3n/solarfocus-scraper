@@ -624,6 +624,50 @@ DELTA_ELAPSED_GRACE = 2.0
 # is the right trade against disabling transposition detection entirely.
 DELTA_ELAPSED_MAX_SCALE = 4.0
 
+# Consecutive cycles a field may OCR to None before its HA entity is marked
+# unavailable.
+#
+# A None lands in NEITHER `accepted` nor `rejected`, so a field that stops
+# reading is invisible: the cycle logs `ok`, accepted_count looks normal, and
+# HA keeps serving the last retained value as though it were live. That is how
+# og_vorlaufsolltemperatur sat frozen at 29.0 (a clipped bbox, fixed in the
+# preceding commit) without anything noticing.
+#
+# Some absences are legitimate and sustained: the heater does not render the OG
+# setpoint row at all in Absenkbetrieb, so the field is correctly None for as
+# long as the circuit stays in setback. Publishing the last value through that
+# is a lie regardless of the cause, so availability is driven by absence, not by
+# whether the absence is a bug.
+#
+# The threshold keeps a single transient OCR miss from flapping the entity; 3
+# matches DELTA_CONFIRM_THRESHOLD and ALERT_CLEAR_CONFIRM_CYCLES.
+FIELD_UNAVAILABLE_AFTER_CYCLES = 3
+
+_FIELD_NONE_STREAK: dict[str, int] = {}
+_FIELD_AVAILABLE: dict[str, bool] = {}
+
+def _field_availability_topic(field: str) -> str:
+    # Second level under the field name, so the scraper's own `solarfocus/+`
+    # retained-value subscription does not pick these up as sensor values.
+    return f"{MQTT_TOPIC_PREFIX}/{field}/available"
+
+def _publish_field_availability(broker: Optional[MqttBroker], dry_run: bool,
+                                field: str, online: bool) -> None:
+    """Flip a single field's availability, only on an actual transition."""
+    if not broker or dry_run:
+        return
+    if _FIELD_AVAILABLE.get(field) == online:
+        return
+    _FIELD_AVAILABLE[field] = online
+    broker.publish(_field_availability_topic(field),
+                   "online" if online else "offline", retain=True)
+    event(logging.INFO if online else logging.WARNING,
+          "field_available" if online else "field_unavailable",
+          "field readable again" if online else
+          "field OCR'd to None for %d consecutive cycles — marking unavailable"
+          % FIELD_UNAVAILABLE_AFTER_CYCLES,
+          field=field)
+
 # When each field's currently-published value was accepted. Used only to age the
 # delta budget. In-process by design: it is empty after a restart, which yields
 # scale 1.0 — identical to the pre-2026-09-01 behaviour, so a cold start is
@@ -846,6 +890,11 @@ m_screen_ident = Counter(
     "solarfocus_scraper_screen_identified_total",
     "Screens identified by the recognizer, split by detection method",
     ["screen", "via"],  # via: "hash" | "ocr" | "icon"
+)
+m_field_missing = Counter(
+    "solarfocus_scraper_field_missing_total",
+    "Cycles in which a field OCR'd to None (present in neither accepted nor rejected)",
+    ["field"],
 )
 m_screen_hash_adopted = Counter(
     "solarfocus_scraper_screen_hash_adopted_total",
@@ -1656,15 +1705,29 @@ def publish_discovery(broker: MqttBroker) -> None:
             "unique_id": f"{MQTT_DEVICE_ID}_{field}",
             "object_id": f"{MQTT_DEVICE_ID}_{field}",
             "state_topic": f"{MQTT_TOPIC_PREFIX}/{field}",
-            # Heater readings ONLY. When a cycle cannot produce values, these go
-            # `unavailable` in HA instead of holding a stale number that looks
-            # live. Deliberately NOT applied to the scraper's own diagnostic
+            # Heater readings ONLY, and gated on TWO independent signals with
+            # availability_mode "all" — the entity is available only if both say
+            # so. Deliberately NOT applied to the scraper's own diagnostic
             # entities below (status, last_run, alert/*): those must stay
             # readable precisely when the heater sensors are unavailable, since
             # they are what explain WHY.
-            "availability_topic": f"{MQTT_TOPIC_PREFIX}/scraper/availability",
-            "payload_available": "online",
-            "payload_not_available": "offline",
+            #
+            #   scraper/availability  — the whole cycle failed, no fresh values.
+            #   <field>/available     — this ONE field stopped reading while the
+            #                           rest of the cycle succeeded. Clearing the
+            #                           retained state topic would not fix that:
+            #                           the retain flag only governs what the
+            #                           broker replays to NEW subscribers, so a
+            #                           connected HA would keep the stale value
+            #                           in its state machine regardless.
+            #                           Availability is a real message HA acts on.
+            "availability": [
+                {"topic": f"{MQTT_TOPIC_PREFIX}/scraper/availability",
+                 "payload_available": "online", "payload_not_available": "offline"},
+                {"topic": _field_availability_topic(field),
+                 "payload_available": "online", "payload_not_available": "offline"},
+            ],
+            "availability_mode": "all",
             "device": DEVICE_BLOCK,
         }
         if meta.unit:
@@ -1674,6 +1737,12 @@ def publish_discovery(broker: MqttBroker) -> None:
         if meta.state_class:
             cfg["state_class"] = meta.state_class
         broker.publish(topic, cfg, retain=True)
+        # Seed availability. HA holds an entity unavailable until it has SEEN an
+        # availability message, so without this every sensor would register as
+        # Unavailable and stay there until its first absence.
+        if _FIELD_AVAILABLE.get(field) is None:
+            _FIELD_AVAILABLE[field] = True
+            broker.publish(_field_availability_topic(field), "online", retain=True)
 
     # pause switch
     sw_topic = f"{MQTT_DISCOVERY_PREFIX}/switch/{MQTT_DEVICE_ID}/pause/config"
@@ -3198,6 +3267,19 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
         # for the edge case where every readable field was rejected — that
         # implies the scrape is globally broken (wrong screen, alert modal).
         accepted = {f: v for f, v in values.items() if v is not None and f not in rejected}
+        # Fields that OCR'd to None. These are in NEITHER counter, which is
+        # precisely why a dead field can hide behind a healthy accepted_count.
+        missing = sorted(f for f, v in values.items() if v is None)
+        for f in missing:
+            m_field_missing.labels(field=f).inc()
+            n = _FIELD_NONE_STREAK.get(f, 0) + 1
+            _FIELD_NONE_STREAK[f] = n
+            if n >= FIELD_UNAVAILABLE_AFTER_CYCLES:
+                _publish_field_availability(broker, dry_run, f, online=False)
+        for f in values:
+            if values[f] is not None:
+                _FIELD_NONE_STREAK.pop(f, None)
+                _publish_field_availability(broker, dry_run, f, online=True)
         if rejected and not accepted:
             event(logging.ERROR, "sanity_check_failed",
                   "all fields rejected", rejected=rejected)
@@ -3251,7 +3333,8 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
         final_status = result_status
         event(logging.INFO, "cycle_complete",
               f"cycle {result_status}", duration_s=round(duration, 2),
-              accepted_count=len(accepted), rejected_count=len(rejected))
+              accepted_count=len(accepted), rejected_count=len(rejected),
+              missing_count=len(missing), missing_fields=missing)
         return CycleResult(status=result_status, values=values)
     except Exception as e:
         final_status, final_error = "error", str(e)

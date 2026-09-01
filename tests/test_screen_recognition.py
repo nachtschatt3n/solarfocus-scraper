@@ -578,10 +578,18 @@ def test_availability_topic_on_heater_sensors_only():
         cfg = _j.loads(payload) if isinstance(payload, str) else payload
         field = topic.split("/")[-2]
         if field in m.SENSORS:
-            assert cfg.get("availability_topic") == avail, f"{field} lacks availability_topic"
+            # Two independent sources, BOTH required: the whole-cycle signal and
+            # this one field's own. availability_mode "all" is what makes a
+            # single dead field mark only that entity unavailable.
+            topics = [a["topic"] for a in cfg["availability"]]
+            assert avail in topics, f"{field} lost the cycle-level availability"
+            assert m._field_availability_topic(field) in topics, \
+                f"{field} lacks its per-field availability topic"
+            assert cfg["availability_mode"] == "all", \
+                f"{field} availability_mode must be 'all', got {cfg.get('availability_mode')}"
             heater += 1
         elif field in ("scraper_status", "scraper_last_run"):
-            assert "availability_topic" not in cfg, \
+            assert "availability" not in cfg and "availability_topic" not in cfg, \
                 f"diagnostic entity {field} must stay readable during a stall"
             diag += 1
     assert heater >= 30, f"only {heater} heater sensors carried availability_topic"
@@ -617,6 +625,69 @@ def test_old_retained_error_image_topic_is_cleared():
     old = f"{m.MQTT_TOPIC_PREFIX}/scraper/last_error_image"
     assert [p for t, p in b.published if t == old] == [""], \
         "old retained image topic not cleared"
+
+
+# ---------------------------------------------------------------------------
+# Per-field availability. A field that stops reading must stop looking live.
+# ---------------------------------------------------------------------------
+
+def _reset_field_avail():
+    m._FIELD_NONE_STREAK.clear()
+    m._FIELD_AVAILABLE.clear()
+
+
+def _avail_msgs(b, field):
+    return [p for t, p in b.published if t == m._field_availability_topic(field)]
+
+
+def test_single_missed_read_does_not_mark_unavailable():
+    """One transient OCR miss must not flap the entity."""
+    _reset_field_avail()
+    b = _FakeBroker()
+    m._FIELD_AVAILABLE["kesseltemperatur"] = True
+    m._FIELD_NONE_STREAK["kesseltemperatur"] = 1
+    if 1 >= m.FIELD_UNAVAILABLE_AFTER_CYCLES:
+        raise AssertionError("threshold too low to protect against a single miss")
+    assert _avail_msgs(b, "kesseltemperatur") == []
+
+
+def test_sustained_absence_marks_unavailable_once():
+    _reset_field_avail()
+    b = _FakeBroker()
+    m._FIELD_AVAILABLE["kesseltemperatur"] = True
+    for _ in range(m.FIELD_UNAVAILABLE_AFTER_CYCLES + 4):
+        m._publish_field_availability(b, False, "kesseltemperatur", online=False)
+    assert _avail_msgs(b, "kesseltemperatur") == ["offline"], \
+        "must publish exactly once on the transition, not every cycle"
+
+
+def test_field_returns_to_available_when_it_reads_again():
+    _reset_field_avail()
+    b = _FakeBroker()
+    m._FIELD_AVAILABLE["kesseltemperatur"] = True
+    m._publish_field_availability(b, False, "kesseltemperatur", online=False)
+    m._publish_field_availability(b, False, "kesseltemperatur", online=True)
+    assert _avail_msgs(b, "kesseltemperatur") == ["offline", "online"]
+
+
+def test_availability_topic_is_not_mistaken_for_a_sensor_value():
+    """The scraper subscribes solarfocus/+ to recover retained sensor values.
+    A per-field availability topic must sit deeper so it cannot be read back as
+    that field's value."""
+    t = m._field_availability_topic("kesseltemperatur")
+    rest = t[len(m.MQTT_TOPIC_PREFIX) + 1:]
+    assert "/" in rest, f"{t} would match the solarfocus/+ value subscription"
+
+
+def test_discovery_seeds_every_heater_field_online():
+    """HA holds an entity unavailable until it has seen an availability
+    message, so a fresh deploy must seed them or everything reads Unavailable."""
+    _reset_field_avail()
+    b = _FakeBroker()
+    m.publish_discovery(b)
+    for field in m.SENSORS:
+        assert _avail_msgs(b, field) == ["online"], \
+            f"{field} not seeded online at discovery"
 
 
 def _run() -> int:
