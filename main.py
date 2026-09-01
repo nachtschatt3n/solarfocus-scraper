@@ -287,7 +287,19 @@ BBOXES: dict[str, FieldSpec] = {
     # either without changing the OCR output — the digit glyphs sit centered
     # in the crop in both cases.
     "og_vorlauftemperatur":     FieldSpec("heizkreise_og", (365, 316,  80, 26), FIELD_NUM,  "float"),
-    "og_vorlaufsolltemperatur": FieldSpec("heizkreise_og", (365, 355,  80, 22), FIELD_NUM,  "float"),
+    # y was 355 h=22 until 2026-09-01: ~5px too low, clipping the digits so the
+    # field read empty in HEIZBETRIEB and published nothing while HA kept showing
+    # a stale retained 29.0 as if live. Vertical sweep on the committed
+    # Heizbetrieb capture: dy -10..-5 all read 46 cleanly, dy -4..-2 return
+    # garbage (456 / 48 / 40), dy 0..+2 empty. 348 h=26 sits mid-band with 6px
+    # clearance from og_vorlauftemperatur above (ends 342) and
+    # og_mischerposition below (starts 380). Sibling fbh_vorlaufsolltemperatur
+    # already used y=350 — this row was simply the odd one out.
+    #
+    # NOTE: this field is legitimately absent in ABSENKBETRIEB — the heater
+    # does not render the row at all in setback, so None is CORRECT there and
+    # must stay that way. Both modes are pinned in tests/test_og_solltemp_bbox.py.
+    "og_vorlaufsolltemperatur": FieldSpec("heizkreise_og", (365, 348,  80, 26), FIELD_NUM,  "float"),
     "og_mischerposition":       FieldSpec("heizkreise_og", (380, 380,  70, 22), FIELD_NUM,  "float"),
     "og_status_text":           FieldSpec("heizkreise_og", (130, 410, 360, 28), FIELD_TEXT, "str", invert=True),
     "og_heizkreis_status":      FieldSpec("heizkreise_og", ( 80, 445, 520, 22), FIELD_TEXT, "str", invert=True),
