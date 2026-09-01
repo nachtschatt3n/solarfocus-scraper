@@ -588,6 +588,37 @@ def test_availability_topic_on_heater_sensors_only():
     assert diag >= 2
 
 
+def test_error_image_is_off_the_sensor_wildcard_tree():
+    """The retained base64 frame must not sit under MQTT_TOPIC_PREFIX.
+
+    Measured 2026-09-01: it is 17,189 bytes and made up 89% of a
+    `solarfocus/#` dump (19,224 with it, 1,999 without). Retention stays —
+    it is what keeps the HA image entity populated across restarts, and how
+    the KESSELREINIGUNG frame was recovered without touching VNC.
+    """
+    b = _FakeBroker()
+    m.publish_discovery(b)
+    cfg = [p for t, p in b.published
+           if t.endswith(f"/image/{m.MQTT_DEVICE_ID}/last_error_image/config") and p]
+    assert len(cfg) == 1
+    import json as _j
+    raw = cfg[0]
+    topic = (raw if isinstance(raw, dict) else _j.loads(raw))["image_topic"]
+    assert topic.startswith(m.MQTT_DIAG_TOPIC_PREFIX + "/"), topic
+    assert not topic.startswith(m.MQTT_TOPIC_PREFIX + "/"), \
+        f"still on the sensor wildcard tree: {topic}"
+
+
+def test_old_retained_error_image_topic_is_cleared():
+    """Deleting the code is not enough — the broker would replay the old
+    retained payload into solarfocus/# forever."""
+    b = _FakeBroker()
+    m.publish_discovery(b)
+    old = f"{m.MQTT_TOPIC_PREFIX}/scraper/last_error_image"
+    assert [p for t, p in b.published if t == old] == [""], \
+        "old retained image topic not cleared"
+
+
 def _run() -> int:
     failures = 0
     for name, fn in sorted(globals().items()):

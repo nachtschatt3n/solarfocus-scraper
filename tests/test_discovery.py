@@ -38,7 +38,9 @@ def test_last_error_image_entity_discovered():
     assert key in emitted, "image discovery config not published"
     payload, retain = emitted[key]
     assert retain is True, "discovery must be retained"
-    assert payload["image_topic"] == f"{m.MQTT_TOPIC_PREFIX}/scraper/last_error_image"
+    # Moved off the sensor wildcard tree 2026-09-01: retained, but on the
+    # sibling diag prefix so it stops dominating a `solarfocus/#` dump.
+    assert payload["image_topic"] == f"{m.MQTT_DIAG_TOPIC_PREFIX}/scraper/last_error_image"
     assert payload["image_encoding"] == "b64"
     assert payload["content_type"] == "image/png"
     assert payload["unique_id"] == f"{m.MQTT_DEVICE_ID}_last_error_image"

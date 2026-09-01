@@ -677,6 +677,19 @@ VNC_PASSWORD = env("VNC_PASSWORD", "")
 MQTT_HOST = env("MQTT_HOST", "localhost")
 MQTT_PORT = int(env("MQTT_PORT", "1883"))
 MQTT_TOPIC_PREFIX = env("MQTT_TOPIC_PREFIX", "solarfocus")
+# Bulky diagnostic payloads live on a SIBLING tree, not under MQTT_TOPIC_PREFIX.
+#
+# scraper/last_error_image is a retained base64 PNG of the framebuffer we got
+# stuck on. Retention is deliberate and worth keeping: it is what lets the HA
+# `image.` entity still show the last stuck frame after a restart, and it is how
+# the KESSELREINIGUNG dialog was recovered on 2026-08-31 without touching VNC.
+#
+# The cost is that it dominates any wildcard dump of the sensor tree. Measured
+# 2026-09-01: the retained payload is 17,189 bytes, and a `solarfocus/#` dump is
+# 19,224 bytes with it versus 1,999 bytes without — 89% of the dump is this one
+# topic. Moving it to `solarfocus-diag/` keeps the diagnostic (and its
+# retention) while making `solarfocus/#` readable again.
+MQTT_DIAG_TOPIC_PREFIX = env("MQTT_DIAG_TOPIC_PREFIX", f"{MQTT_TOPIC_PREFIX}-diag")
 MQTT_DISCOVERY_PREFIX = env("MQTT_DISCOVERY_PREFIX", "homeassistant")
 MQTT_DEVICE_ID = env("MQTT_DEVICE_ID", "solarfocus_pellettop")
 # Initial-connect + auto-reconnect backoff. The broker (Mosquitto) is briefly
@@ -1698,12 +1711,16 @@ def publish_discovery(broker: MqttBroker) -> None:
         "name": "Last Error Image",
         "unique_id": f"{MQTT_DEVICE_ID}_last_error_image",
         "object_id": f"{MQTT_DEVICE_ID}_last_error_image",
-        "image_topic": f"{MQTT_TOPIC_PREFIX}/scraper/last_error_image",
+        "image_topic": f"{MQTT_DIAG_TOPIC_PREFIX}/scraper/last_error_image",
         "image_encoding": "b64",
         "content_type": "image/png",
         "entity_category": "diagnostic",
         "device": DEVICE_BLOCK,
     }, retain=True)
+    # MIGRATION: the image used to be published RETAINED under MQTT_TOPIC_PREFIX,
+    # so the broker would replay it into `solarfocus/#` forever. Clear it once.
+    # Removable after every broker has seen this build.
+    broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/last_error_image", "", retain=True)
 
     # Per-probe fill indicators. on=green (has pellets), off=red (empty).
     # device_class is deliberately omitted — these aren't "problems" in the HA
@@ -3196,7 +3213,7 @@ def _handle_nav_fail(client, broker: Optional[MqttBroker], dry_run: bool, screen
     m_runs.labels(status="navigation_failed").inc()
     _publish_availability(broker, dry_run, online=False)
     if broker and not dry_run and b64:
-        broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/last_error_image", b64, retain=True)
+        broker.publish(f"{MQTT_DIAG_TOPIC_PREFIX}/scraper/last_error_image", b64, retain=True)
         broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "navigation_failed", retain=True)
     return CycleResult(status="navigation_failed", values={}, error_image_b64=b64)
 
