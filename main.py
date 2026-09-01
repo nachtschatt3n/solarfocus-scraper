@@ -577,6 +577,60 @@ MAX_DELTA_PER_CYCLE: dict[str, float] = {
     "pelletsverbrauch_kg":         20.0,   # peak burn ~2 kg/min
 }
 
+# The delta budgets above are per-CYCLE, but the gap between two readings is not
+# constant. After an outage the previous value is hours old, so a perfectly
+# correct reading looks like an impossible jump and gets rejected — a
+# self-inflicted data gap stacked on top of the original one.
+#
+# Observed 2026-08-31: a 6.4h stall was followed by a 12-field rejection wave on
+# resume (kesseltemperatur 38->69, outside_temperature 26->16, four run-hour
+# counters, puffer_temp_top 40->71 ...), all physically correct and all held
+# back for 3 cycles by the confirmation breaker. The control group is the roll
+# 2h later with a ~2 minute gap: three consecutive 44-accepted / 0-rejected
+# cycles, no wave.
+#
+# So scale the budget by how long the baseline has actually been sitting.
+#
+# GRACE: no widening at all until the gap exceeds this many nominal intervals.
+# Normal cycles land around 390s against SCRAPE_INTERVAL_SECONDS=300, and
+# scaling straight off that ratio would silently loosen every gate by ~30% in
+# steady state. The gate must be UNCHANGED in normal operation and widen only
+# for a real outage.
+DELTA_ELAPSED_GRACE = 2.0
+# CEILING: the scaling is capped, because an uncapped budget stops catching the
+# OCR digit-drop / digit-insert errors this gate exists for.
+#
+# Sizing evidence, from the 2026-08-31 wave (7 of the 12 fields captured before
+# the pod was replaced): every legitimate post-gap reading needed a scale of at
+# most 1.25x, even after 6.4h — boiler and buffer temperatures saturate rather
+# than climb without bound. Run-hour counters are the demanding case, since they
+# can advance one hour per elapsed hour: against a 2.0h budget, a gap of up to
+# ~8h fits inside 4.0x.
+#
+# Beyond ~8h, counters will still hit the ceiling and take the 3-cycle
+# confirmation path. That is a deliberate, bounded, self-clearing delay, and it
+# is the right trade against disabling transposition detection entirely.
+DELTA_ELAPSED_MAX_SCALE = 4.0
+
+# When each field's currently-published value was accepted. Used only to age the
+# delta budget. In-process by design: it is empty after a restart, which yields
+# scale 1.0 — identical to the pre-2026-09-01 behaviour, so a cold start is
+# never worse than before, only un-improved.
+_LAST_ACCEPTED_TS: dict[str, float] = {}
+
+def _delta_allowance(field: str, max_delta: float,
+                     now: Optional[float] = None) -> tuple[float, float]:
+    """Return (allowed_delta, scale) for `field`, aged by elapsed time."""
+    ts = _LAST_ACCEPTED_TS.get(field)
+    if ts is None:
+        return max_delta, 1.0
+    elapsed = (time.time() if now is None else now) - ts
+    if elapsed <= DELTA_ELAPSED_GRACE * SCRAPE_INTERVAL_SECONDS:
+        return max_delta, 1.0
+    scale = min(DELTA_ELAPSED_MAX_SCALE, elapsed / SCRAPE_INTERVAL_SECONDS)
+    scale = max(1.0, scale)
+    return max_delta * scale, scale
+
 # Deadlock-breaker for legitimate large changes. If a field reads the same (≈)
 # out-of-delta value across N consecutive cycles, accept it — OCR misreads
 # don't repeat pixel-identically, so persistent agreement implies the physical
@@ -2932,7 +2986,8 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
             if prev_str:
                 try:
                     prev = float(prev_str)
-                    over = abs(val - prev) > max_delta
+                    allowed, scale = _delta_allowance(field, max_delta)
+                    over = abs(val - prev) > allowed
                     if over and allow_delta_override:
                         tol = max(1.0, max_delta * 0.1)
                         tracked = _DELTA_CONFIRM.get(field)
@@ -2945,16 +3000,19 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
                                   "accepting out-of-delta value after persistent confirmation",
                                   field=field, value=val, prev=prev,
                                   delta=val - prev, max_delta=max_delta,
+                                  allowed=round(allowed, 2), elapsed_scale=round(scale, 2),
                                   confirmations=count)
                             _DELTA_CONFIRM.pop(field, None)
                             continue
                         _DELTA_CONFIRM[field] = (val, count)
                         rejected[field] = (
-                            f"{val} delta={val - prev:+.1f} exceeds ±{max_delta} "
+                            f"{val} delta={val - prev:+.1f} exceeds ±{allowed:g} "
+                            f"(base ±{max_delta:g} x{scale:.2f} elapsed) "
                             f"from prev={prev} (confirm {count}/{DELTA_CONFIRM_THRESHOLD})")
                     elif over:
                         rejected[field] = (
-                            f"{val} delta={val - prev:+.1f} exceeds ±{max_delta} "
+                            f"{val} delta={val - prev:+.1f} exceeds ±{allowed:g} "
+                            f"(base ±{max_delta:g} x{scale:.2f} elapsed) "
                             f"from prev={prev}")
                     elif allow_delta_override:
                         _DELTA_CONFIRM.pop(field, None)
@@ -3148,7 +3206,10 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
             if first_run_ref and first_run_ref[0]:
                 publish_discovery(broker)
                 first_run_ref[0] = False
+            now_ts = time.time()
             for field, val in accepted.items():
+                # Age the delta budget from when THIS field's baseline landed.
+                _LAST_ACCEPTED_TS[field] = now_ts
                 # bool MUST come before str() — isinstance(True, int) is True in
                 # Python, and "True"/"False" is not what HA's binary_sensor
                 # discovery expects; it'd leave the entity as "unavailable"
