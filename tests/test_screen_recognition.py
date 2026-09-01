@@ -477,25 +477,89 @@ def test_blob_measurement_rejects_runaway_regions():
 class _FakeBroker:
     def __init__(self):
         self.published = []
-        self.alert_latched = False
-        self.alert_latch_title = ""
+        self.alert_absent_streak = 0
     def publish(self, topic, payload, retain=False):
         self.published.append((topic, payload))
-    def latch_alert(self, title):
-        self.alert_latched = True
-        self.alert_latch_title = title
-        self.publish(f"{m.MQTT_TOPIC_PREFIX}/alert/latched", "on", retain=True)
-    def is_alert_latched(self):
-        return self.alert_latched
+    def note_alert_seen(self):
+        self.alert_absent_streak = 0
+    def note_alert_absent(self):
+        self.alert_absent_streak += 1
+        return self.alert_absent_streak
 
 
-def test_latch_survives_and_blocks_the_active_off_publish():
+def _cycle(b, alert_seen: bool):
+    """The alert half of run_cycle, as shipped."""
+    if alert_seen:
+        b.note_alert_seen()
+        b.publish(f"{m.MQTT_TOPIC_PREFIX}/alert/active", "on", retain=True)
+        return
+    streak = b.note_alert_absent()
+    if streak == m.ALERT_CLEAR_CONFIRM_CYCLES:
+        for t in ("active", "title", "body"):
+            b.publish(f"{m.MQTT_TOPIC_PREFIX}/alert/{t}",
+                      "off" if t == "active" else "", retain=True)
+
+
+def _offs(b):
+    return [p for t, p in b.published if t.endswith("/alert/active") and p == "off"]
+
+
+def test_alert_does_not_clear_before_the_confirm_threshold():
+    """One missed detection must not flap the sensor off."""
     b = _FakeBroker()
-    b.latch_alert("Kesselreinigung")
-    assert b.is_alert_latched()
-    # The run_cycle guard: active/off only when nothing is latched.
-    assert not (True and not b.is_alert_latched()), \
-        "alert/active must NOT be cleared while a dismissed alert is latched"
+    _cycle(b, True)
+    for _ in range(m.ALERT_CLEAR_CONFIRM_CYCLES - 1):
+        _cycle(b, False)
+    assert not _offs(b), \
+        f"cleared after fewer than {m.ALERT_CLEAR_CONFIRM_CYCLES} quiet cycles"
+
+
+def test_alert_clears_after_the_confirm_threshold():
+    b = _FakeBroker()
+    _cycle(b, True)
+    for _ in range(m.ALERT_CLEAR_CONFIRM_CYCLES):
+        _cycle(b, False)
+    assert len(_offs(b)) == 1, "should clear exactly once"
+
+
+def test_title_and_body_are_cleared_with_active():
+    """A retained title against active=off reads as a live alert in HA."""
+    b = _FakeBroker()
+    _cycle(b, True)
+    for _ in range(m.ALERT_CLEAR_CONFIRM_CYCLES):
+        _cycle(b, False)
+    cleared = {t.rsplit("/", 1)[-1] for t, p in b.published if p == ""}
+    assert {"title", "body"} <= cleared, f"title/body not cleared, got {cleared}"
+
+
+def test_a_re_raised_condition_never_clears_and_never_flaps():
+    """PELLETSMANGEL-style: heater re-raises every cycle. alert/active must
+    stay on continuously — this is the flapping case."""
+    b = _FakeBroker()
+    for _ in range(30):
+        _cycle(b, True)
+    assert not _offs(b), "a continuously re-raised alert must never clear"
+
+
+def test_intermittent_detection_does_not_clear():
+    """Alert present but missed on some cycles: the streak resets on each
+    detection, so it can never reach the threshold."""
+    b = _FakeBroker()
+    for i in range(30):
+        _cycle(b, alert_seen=(i % 3 == 0))   # seen every 3rd cycle
+    assert not _offs(b), "intermittent detection must not clear the alert"
+
+
+def test_retired_button_is_removed_via_empty_retained_payload():
+    """Deleting the code is not enough — the retained discovery message would
+    keep the orphaned button alive in HA forever."""
+    b = _FakeBroker()
+    m.publish_discovery(b)
+    cfg = f"{m.MQTT_DISCOVERY_PREFIX}/button/{m.MQTT_DEVICE_ID}/alert_reset/config"
+    payloads = [p for t, p in b.published if t == cfg]
+    assert payloads == [""], f"expected one empty retained payload, got {payloads!r}"
+    latched = [p for t, p in b.published if t == f"{m.MQTT_TOPIC_PREFIX}/alert/latched"]
+    assert latched == [""], f"stale alert/latched not cleared, got {latched!r}"
 
 
 def test_availability_topic_on_heater_sensors_only():
@@ -509,12 +573,14 @@ def test_availability_topic_on_heater_sensors_only():
     for topic, payload in b.published:
         if not topic.endswith("/config"):
             continue
+        if payload == "":
+            continue   # retired entity being removed, not a config
         cfg = _j.loads(payload) if isinstance(payload, str) else payload
         field = topic.split("/")[-2]
         if field in m.SENSORS:
             assert cfg.get("availability_topic") == avail, f"{field} lacks availability_topic"
             heater += 1
-        elif field in ("scraper_status", "scraper_last_run", "alert_reset"):
+        elif field in ("scraper_status", "scraper_last_run"):
             assert "availability_topic" not in cfg, \
                 f"diagnostic entity {field} must stay readable during a stall"
             diag += 1

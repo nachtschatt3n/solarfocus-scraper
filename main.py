@@ -432,6 +432,26 @@ INFO_MODAL_BODY_DY = (40, 170, 10)   # start, stop, step below the icon centre
 INFO_MODAL_BODY_DX_STEP = 16
 INFO_MODAL_BODY_WHITE_MIN = 0.80
 
+# Consecutive alert-free cycles before `alert/active` is cleared.
+#
+# The heater does NOT keep re-raising a maintenance reminder once its dialog is
+# acknowledged: on 2026-08-31 the KESSELREINIGUNG prompt was dismissed at
+# 22:19:04Z and did not reappear in the following 17 cycles / ~2h, even though
+# the boiler had NOT been cleaned. So "the dialog stopped appearing" is NOT by
+# itself proof the condition cleared, and this threshold is not trying to prove
+# that — the operator also receives these reminders in the Solarfocus vendor
+# app, which is the authoritative channel for the physical task.
+#
+# What this threshold DOES buy is protection against a single missed detection
+# flapping the sensor. Detection is highly reliable when a dialog is present:
+# across the continuous 2026-08-31 stall the modal was detected on 74 of 74
+# cycles (100%). Three consecutive misses is therefore far outside anything
+# observed, while 3 cycles (~20 min) is short enough that HA tracks reality
+# promptly. Condition-driven alerts that the heater DOES re-raise every cycle
+# (e.g. PELLETSMANGEL, dismissed via back-arrow without acknowledging) simply
+# never accumulate a streak, so `alert/active` stays on continuously for them.
+ALERT_CLEAR_CONFIRM_CYCLES = 3
+
 # --- Modal dismiss geometry ------------------------------------------------
 # NEVER escape a modal by clicking an acknowledge button. The PELLETSMANGEL
 # dialog's bottom-right button is "Lagerraum befüllt" — clicking it to get out
@@ -1435,9 +1455,9 @@ class MqttBroker:
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
         self.pause_state: bool = False  # mirrors retained solarfocus/scraper/pause
-        # Sticky maintenance-alert latch. See ALERT LATCH note on _handle_alert_modal.
-        self.alert_latched: bool = False
-        self.alert_latch_title: str = ""
+        # Consecutive cycles that checked for an alert and found none. See the
+        # ALERT LIFECYCLE note on _handle_alert_modal.
+        self.alert_absent_streak: int = 0
         self.last_values: dict[str, str] = {}  # field -> last retained value (string)
         self._lock = threading.Lock()
 
@@ -1498,8 +1518,6 @@ class MqttBroker:
         event(logging.INFO, "mqtt_connected", "MQTT connected", host=MQTT_HOST, port=MQTT_PORT)
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/scraper/pause")
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/scraper/pause/set")
-        client.subscribe(f"{MQTT_TOPIC_PREFIX}/alert/latched")  # restore latch after restart
-        client.subscribe(f"{MQTT_TOPIC_PREFIX}/alert/reset")    # operator "condition cleared"
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/+")  # capture retained sensor values
 
     def _on_message(self, client, userdata, msg):
@@ -1511,40 +1529,21 @@ class MqttBroker:
         elif topic == f"{MQTT_TOPIC_PREFIX}/scraper/pause/set":
             normalized = "on" if payload.strip().lower() in ("on", "true", "1") else "off"
             client.publish(f"{MQTT_TOPIC_PREFIX}/scraper/pause", normalized, qos=0, retain=True)
-        elif topic == f"{MQTT_TOPIC_PREFIX}/alert/latched":
-            # Retained — restores the latch across pod restarts, so a rollout
-            # cannot silently drop a pending maintenance prompt.
-            with self._lock:
-                self.alert_latched = payload.strip().lower() in ("on", "true", "1")
-        elif topic == f"{MQTT_TOPIC_PREFIX}/alert/reset":
-            with self._lock:
-                was, title = self.alert_latched, self.alert_latch_title
-                self.alert_latched = False
-                self.alert_latch_title = ""
-            client.publish(f"{MQTT_TOPIC_PREFIX}/alert/latched", "off", qos=0, retain=True)
-            client.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "off", qos=0, retain=True)
-            event(logging.INFO, "alert_latch_cleared",
-                  "operator cleared the maintenance-alert latch",
-                  was_latched=was, title=title)
         elif topic.startswith(f"{MQTT_TOPIC_PREFIX}/") and "/" not in topic[len(MQTT_TOPIC_PREFIX) + 1:]:
             field = topic[len(MQTT_TOPIC_PREFIX) + 1:]
             with self._lock:
                 self.last_values[field] = payload
 
-    def latch_alert(self, title: str) -> None:
-        """Mark a maintenance alert as outstanding after WE dismissed its dialog."""
+    def note_alert_seen(self) -> None:
+        """An alert was detected this cycle — the condition is still live."""
         with self._lock:
-            first, self.alert_latched = not self.alert_latched, True
-            self.alert_latch_title = title
-        self.publish(f"{MQTT_TOPIC_PREFIX}/alert/latched", "on", retain=True)
-        if first:
-            event(logging.WARNING, "alert_latched",
-                  "dismissed a maintenance alert — holding alert/active on until "
-                  "the operator confirms the condition is cleared", title=title)
+            self.alert_absent_streak = 0
 
-    def is_alert_latched(self) -> bool:
+    def note_alert_absent(self) -> int:
+        """A cycle checked for an alert and found none. Returns the new streak."""
         with self._lock:
-            return self.alert_latched
+            self.alert_absent_streak += 1
+            return self.alert_absent_streak
 
     def is_paused(self) -> bool:
         with self._lock:
@@ -1612,19 +1611,20 @@ def publish_discovery(broker: MqttBroker) -> None:
         "device": DEVICE_BLOCK,
     }, retain=True)
 
-    # Maintenance-alert latch reset. Pressing this is the operator asserting
-    # "I have physically dealt with the heater's service prompt" — it is the
-    # only thing that clears alert/active once the scraper has dismissed a
-    # dialog on the panel. Without it, auto-dismissal would erase the only
-    # signal that the boiler needs servicing.
-    broker.publish(f"{MQTT_DISCOVERY_PREFIX}/button/{MQTT_DEVICE_ID}/alert_reset/config", {
-        "name": "Clear Heater Service Alert",
-        "unique_id": f"{MQTT_DEVICE_ID}_alert_reset",
-        "object_id": f"{MQTT_DEVICE_ID}_alert_reset",
-        "command_topic": f"{MQTT_TOPIC_PREFIX}/alert/reset",
-        "payload_press": "PRESS",
-        "device": DEVICE_BLOCK,
-    }, retain=True)
+    # RETIRED: the "Clear Heater Service Alert" button and its alert/latched
+    # topic. The manual latch assumed HA was the only place the operator would
+    # see a maintenance reminder; it is not — the Solarfocus vendor app carries
+    # the same message, so alert/active no longer needs a human to release it
+    # (it now auto-clears after ALERT_CLEAR_CONFIRM_CYCLES quiet cycles).
+    #
+    # These two publishes are the MIGRATION, not leftovers. Both topics were
+    # published RETAINED, so deleting the code alone would leave the broker
+    # replaying them forever: HA would keep showing an orphaned button that
+    # commands nothing, and a stale alert/latched value. An empty retained
+    # payload on a discovery topic is how HA is told to remove an entity.
+    broker.publish(f"{MQTT_DISCOVERY_PREFIX}/button/{MQTT_DEVICE_ID}/alert_reset/config",
+                   "", retain=True)
+    broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/latched", "", retain=True)
 
     # status sensor
     broker.publish(f"{MQTT_DISCOVERY_PREFIX}/sensor/{MQTT_DEVICE_ID}/scraper_status/config", {
@@ -2818,21 +2818,15 @@ def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
                   "alert modal has no safe dismiss target — leaving it up",
                   title=title)
             break
-        # ALERT LATCH — precondition for dismissing at all.
+        # ALERT LIFECYCLE — alert/active tracks the CONDITION, not one dialog.
         #
-        # run_cycle clears alert/active as soon as a cycle sees no modal. Before
-        # the detector could see these dialogs the point was moot: we never
-        # dismissed one, so the flag tracked reality. Now that we CAN dismiss a
-        # maintenance prompt, clearing on absence would mean the scraper taps OK,
-        # the modal goes away, and HA reports no alert — while the boiler still
-        # needs the service that prompted it. That trades a visible stall for an
-        # invisible one, which is strictly worse.
-        #
-        # So dismissal latches alert/active on. Only the operator pressing the
-        # "Clear Heater Service Alert" button (alert/reset) clears it, which is
-        # them asserting the physical condition is actually dealt with.
+        # Seeing an alert resets the absent-streak, so a condition the heater
+        # keeps re-raising holds alert/active on indefinitely without flapping.
+        # Absence is only acted on after ALERT_CLEAR_CONFIRM_CYCLES consecutive
+        # alert-free cycles (see run_cycle), so one missed detection cannot
+        # toggle the sensor off and back on.
         if broker and not dry_run:
-            broker.latch_alert(title)
+            broker.note_alert_seen()
         vnc_click(client, *xy)
         time.sleep(CLICK_DELAY_SECONDS)
     return seen
@@ -2998,13 +2992,21 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
             # helper publishes each one to MQTT before dismissing.
             COORD.set_phase("alerts")
             alerts = _handle_alert_modal(client, broker, dry_run)
-            if broker and not dry_run and not alerts and not broker.is_alert_latched():
-                # No alert this cycle AND nothing latched — clear the retained
-                # active flag so HA reflects the current state. Title/body are
-                # left retained so the last alert's text persists as reference.
-                # While latched, the flag stays on even though the dialog is
-                # gone: we are the reason it is gone.
-                broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "off", retain=True)
+            if broker and not dry_run and not alerts:
+                # This cycle checked and found no dialog. Only clear once the
+                # absence has repeated, so a single missed detection cannot
+                # flap the sensor off and back on. Title and body are cleared
+                # together with the flag — a retained title against active=off
+                # reads as a live alert in HA and was its own small lie.
+                streak = broker.note_alert_absent()
+                if streak == ALERT_CLEAR_CONFIRM_CYCLES:
+                    broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "off", retain=True)
+                    broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/title", "", retain=True)
+                    broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/body", "", retain=True)
+                    event(logging.INFO, "alert_cleared",
+                          "no alert dialog for %d consecutive cycles — clearing"
+                          % ALERT_CLEAR_CONFIRM_CYCLES,
+                          confirm_cycles=ALERT_CLEAR_CONFIRM_CYCLES)
 
             screens_needed = sorted({spec.screen for spec in BBOXES.values()} | {"main"})
 
