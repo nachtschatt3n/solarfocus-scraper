@@ -536,6 +536,40 @@ COUNTER_FIELDS: set[str] = {
     "rla_pumpe_h", "og_h", "fussbodenheizung_h",
 }
 
+# Scale factors a dropped decimal point can introduce on a counter readout.
+# The panel renders these meters with one OR two decimals depending on the
+# field ("6594.5", "557.51"), so a swallowed '.' multiplies the parsed value by
+# 10 or 100 respectively. 1000 is included for headroom, not because it has
+# been observed.
+#
+# parse_value() already repairs this class, but only for exactly-3-digit reads
+# (see its comment): it has no baseline to compare against, so it cannot safely
+# reinterpret a 5-digit number. Here we do have the previous value, which makes
+# the test decisive — see _counter_scale_repair().
+COUNTER_SCALE_FACTORS: tuple[float, ...] = (10.0, 100.0, 1000.0)
+
+# A counter read at least this many times its own baseline is not a reading,
+# it is a misparse: an hour meter reaching 5x its previous value in one cycle
+# would mean tens of thousands of hours elapsed since the last scrape.
+#
+# This exists because SANITY_BOUNDS cannot help these fields. Their bounds are
+# (0, 1_000_000) — deliberately wide, since they legitimately grow without
+# limit — so the bounds layer NEVER fires for them, and the invariant that
+# protects every other field ("a bounds failure never advances the delta
+# confirmation counter") gives them no protection at all. That left the
+# 3-cycle delta_override as the only gate, and a *stable* misread is exactly
+# what it is designed to accept: OCR that repeats the same wrong glyph three
+# times looks identical to a real move. Observed corrupting HA long-term
+# statistics four times in 21 days (2026-08-22 .. 2026-09-03), e.g.
+# einschub_h 6594.4 -> 65945.0 held ~36h.
+COUNTER_IMPLAUSIBLE_RATIO = 5.0
+
+# ...but only once the baseline is large enough that the ratio means something.
+# A meter still near zero can legitimately multiply (0.1 -> 0.6 is a ratio of
+# 6 and a perfectly real 0.5h of runtime), so the ratio guard stays out of the
+# way below this. Above 10h, a 5x jump is physically impossible.
+COUNTER_RATIO_GUARD_MIN_PREV = 10.0
+
 # Maximum absolute change allowed between consecutive cycles per field. Catches
 # OCR digit-swaps / prefix-smears that would pass a static range check (e.g.
 # kesseltemperatur jumping 62 → 869 — "in range" under a 0-1000 bound, but
@@ -686,6 +720,46 @@ def _delta_allowance(field: str, max_delta: float,
     scale = min(DELTA_ELAPSED_MAX_SCALE, elapsed / SCRAPE_INTERVAL_SECONDS)
     scale = max(1.0, scale)
     return max_delta * scale, scale
+
+def _counter_scale_repair(field: str, val: float, prev: float) -> Optional[float]:
+    """Return `val` with its dropped decimal point restored, or None if `val`
+    is not a dropped-decimal misread of a plausible reading.
+
+    The test is deliberately narrow, and its narrowness is what makes it safe
+    to repair rather than merely reject: we only rewrite `val` when dividing it
+    by a power of ten lands within the field's NORMAL per-cycle delta budget of
+    the previous value, and does not move the counter backwards. In other
+    words, we accept the repair only when inserting a decimal point turns an
+    impossible reading into an unremarkable one.
+
+    Verified against all four occurrences observed in production:
+
+        saugaustragung_h  557.4  -> 55751.0  ->  557.51  (/100, +0.11)
+        saugaustragung_h  557.81 ->  5586.0  ->  558.6   (/10,  +0.79)
+        einschub_h       6594.4  -> 65945.0  -> 6594.5   (/10,  +0.10)
+        einschub_h       6597.4  -> 65975.0  -> 6597.5   (/10,  +0.10)
+
+    Returns None for in-budget values (nothing to repair), for non-integral
+    reads (a dropped '.' always yields an integer), and for anything whose
+    rescaling does not land cleanly — those fall through to the ordinary delta
+    gate, where COUNTER_IMPLAUSIBLE_RATIO stops them being confirmed.
+    """
+    base = MAX_DELTA_PER_CYCLE.get(field)
+    if base is None or prev <= 0 or val <= prev:
+        return None
+    # A swallowed decimal point always produces a whole number.
+    if val != int(val):
+        return None
+    allowed, _ = _delta_allowance(field, base)
+    if abs(val - prev) <= allowed:
+        return None                      # plausible as-is; not our business
+    for scale in COUNTER_SCALE_FACTORS:
+        candidate = val / scale
+        # `candidate >= prev` keeps the repair monotonic: we never invent a
+        # decrease, which would only trip the monotonicity guard downstream.
+        if candidate >= prev and abs(candidate - prev) <= allowed:
+            return round(candidate, 3)
+    return None
 
 # Deadlock-breaker for legitimate large changes. If a field reads the same (≈)
 # out-of-delta value across N consecutive cycles, accept it — OCR misreads
@@ -2988,11 +3062,18 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
                   allow_delta_override: bool = False) -> dict[str, str]:
     """Return a dict of {field: reject_reason} — empty if all values passed.
 
-    Three layers per field:
+    Four layers per field:
       1. Static bounds (SANITY_BOUNDS) — physical range.
-      2. Counter monotonicity (COUNTER_FIELDS) — hour meters never decrease.
-      3. Delta check (MAX_DELTA_PER_CYCLE) — plausible change between cycles.
-         Skipped when no prior value is known.
+      2. Counter decimal repair (COUNTER_SCALE_FACTORS) — an hour meter read a
+         power of ten too large is rewritten in `values`, not rejected.
+      3. Counter monotonicity (COUNTER_FIELDS) — hour meters never decrease.
+      4. Delta check (MAX_DELTA_PER_CYCLE) — plausible change between cycles.
+         Skipped when no prior value is known. A counter exceeding
+         COUNTER_IMPLAUSIBLE_RATIO x its baseline is rejected here without
+         becoming confirmable.
+
+    Layer 2 MUTATES `values` in place — it is the one layer that corrects a
+    reading rather than judging it.
 
     `allow_delta_override=True` enables the deadlock-breaker on TWO paths:
       - Delta-exceed: persistent out-of-delta reads get counted in
@@ -3024,6 +3105,25 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
             if not (lo <= val <= hi):
                 rejected[field] = f"{val} out of bounds [{lo}, {hi}]"
                 continue
+        # Dropped-decimal repair, ahead of the monotonicity and delta gates so
+        # a repaired value is judged on its merits rather than as a 10x jump.
+        if (field in COUNTER_FIELDS and broker
+                and isinstance(val, (int, float))):
+            prev_str = broker.get_last(field)
+            if prev_str:
+                try:
+                    repaired = _counter_scale_repair(field, float(val),
+                                                     float(prev_str))
+                except ValueError:
+                    repaired = None
+                if repaired is not None:
+                    event(logging.WARNING, "counter_decimal_repaired",
+                          "counter read as a whole number a power of ten too "
+                          "large — restoring the dropped decimal point",
+                          field=field, raw=val, value=repaired,
+                          prev=float(prev_str))
+                    values[field] = repaired
+                    val = repaired
         if field in COUNTER_FIELDS and broker and isinstance(val, (int, float)):
             prev_str = broker.get_last(field)
             if prev_str:
@@ -3069,6 +3169,20 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
                     prev = float(prev_str)
                     allowed, scale = _delta_allowance(field, max_delta)
                     over = abs(val - prev) > allowed
+                    # A counter cannot multiply. Reject without touching
+                    # _DELTA_CONFIRM, so a repeatably-misread glyph can never
+                    # be promoted to baseline the way a real move is. This is
+                    # the protection SANITY_BOUNDS gives every narrowly-bounded
+                    # field and cannot give these; see COUNTER_IMPLAUSIBLE_RATIO.
+                    if (over and field in COUNTER_FIELDS
+                            and prev >= COUNTER_RATIO_GUARD_MIN_PREV
+                            and val >= prev * COUNTER_IMPLAUSIBLE_RATIO):
+                        _DELTA_CONFIRM.pop(field, None)
+                        rejected[field] = (
+                            f"{val} is {val / prev:.1f}x prev={prev} "
+                            f"(counter cannot exceed {COUNTER_IMPLAUSIBLE_RATIO:g}x; "
+                            f"not confirmable)")
+                        continue
                     if over and allow_delta_override:
                         tol = max(1.0, max_delta * 0.1)
                         tracked = _DELTA_CONFIRM.get(field)

@@ -181,8 +181,23 @@ def test_in_bounds_transpositions_are_caught_by_the_DELTA_gate_specifically():
         _age(f, 24 * 3600)
         rejected = m._sanity_check({f: bad}, broker)
         assert f in rejected, f"{f} {prev} -> {bad} not rejected after 24h"
-        assert "exceeds" in rejected[f], \
-            f"{f} must be rejected BY THE DELTA GATE, got: {rejected[f]}"
+        # Two delta-family gates can legitimately take these, and the split is
+        # pinned per-case so neither can quietly cover for the other. A
+        # magnitude misread on a counter (>=5x its baseline, i.e. the dropped
+        # thousands separator below) belongs to the ratio guard added
+        # 2026-09-05, which is strictly stronger: it also refuses to let the
+        # value become confirmable. Everything else must still be caught by
+        # the elapsed-scaled delta ceiling, which is what this test exists to
+        # protect — those cases keep asserting "exceeds".
+        ratio_guarded = (f in m.COUNTER_FIELDS
+                         and prev >= m.COUNTER_RATIO_GUARD_MIN_PREV
+                         and bad >= prev * m.COUNTER_IMPLAUSIBLE_RATIO)
+        if ratio_guarded:
+            assert "x prev" in rejected[f], \
+                f"{f} must be rejected BY THE RATIO GUARD, got: {rejected[f]}"
+        else:
+            assert "exceeds" in rejected[f], \
+                f"{f} must be rejected BY THE DELTA GATE, got: {rejected[f]}"
 
 
 def test_scale_is_capped():
