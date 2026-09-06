@@ -3505,6 +3505,9 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
 
     event(logging.INFO, "cycle_start", "cycle starting")
     final_status = "error"
+    # Whether this cycle already logged its own closing line. Only the success
+    # path does; see the `finally` below for why the rest need one too.
+    terminal_logged = False
     final_error: Optional[str] = None
     try:
         if COORD.is_maintenance():
@@ -3724,6 +3727,7 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
               f"cycle {result_status}", duration_s=round(duration, 2),
               accepted_count=len(accepted), rejected_count=len(rejected),
               missing_count=len(missing), missing_fields=missing)
+        terminal_logged = True
         return CycleResult(status=result_status, values=values)
     except Exception as e:
         final_status, final_error = "error", str(e)
@@ -3731,7 +3735,38 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
         event(logging.ERROR, "cycle_error", "unhandled cycle exception", error=str(e))
         raise
     finally:
+        # Every cycle closes with exactly one terminal line. Only the success
+        # path used to log one, so a failed cycle incremented
+        # runs_total{status="navigation_failed"} and then simply stopped
+        # talking: anyone triaging from logs alone saw a `cycle_start` with no
+        # end and had to reconcile against Prometheus to learn whether it had
+        # failed or was still hung. Observed 2026-09-06 10:23:49, where a clean
+        # fail-and-retry read as a hang for several minutes.
+        if not terminal_logged:
+            _log_cycle_terminal(final_status, final_error,
+                                COORD.cycle_started_ts)
         COORD.end_cycle(final_status, error=final_error)
+
+# Terminal outcomes the operator asked for. These are idles, not faults, so
+# they close at INFO and must never look like a failure to anyone triaging.
+CYCLE_OPERATOR_IDLE_STATUSES = ("paused", "maintenance")
+
+def _log_cycle_terminal(final_status: str, final_error: Optional[str],
+                        started_ts: float) -> None:
+    """Emit the one closing line for a cycle that did not reach `cycle_complete`.
+
+    Only the success path used to log an ending, so a failed cycle incremented
+    runs_total{status="navigation_failed"} and then simply stopped talking.
+    Triaging from logs alone showed a `cycle_start` with no end, and telling
+    "failed, will retry" from "hung" meant reconciling against Prometheus.
+    Observed 2026-09-06 10:23:49, where a clean fail-and-retry read as a hang
+    for several minutes.
+    """
+    event(logging.INFO if final_status in CYCLE_OPERATOR_IDLE_STATUSES
+          else logging.ERROR,
+          "cycle_end", f"cycle {final_status}",
+          status=final_status, error=final_error,
+          duration_s=round(time.time() - started_ts, 2))
 
 def _publish_availability(broker: Optional[MqttBroker], dry_run: bool, online: bool) -> None:
     """Mark the HEATER sensors available/unavailable in HA.
