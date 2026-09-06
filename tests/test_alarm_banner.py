@@ -99,6 +99,25 @@ def test_banner_joins_the_cycle_values():
     assert "alarm_banner" in m.SENSORS
 
 
+def test_healthy_publishes_a_value_not_a_missing_field():
+    """A None would land in neither `accepted` nor `rejected`, so the healthy
+    case would count as MISSING every cycle, trip FIELD_UNAVAILABLE_AFTER_CYCLES
+    and leave the alarm sensor permanently `unavailable` in HA except during a
+    fault — and would make "no alarm" indistinguishable from "OCR failed"."""
+    out = m._ocr_all({"main": _healthy_img()})
+    assert out["alarm_banner"] == m.ALARM_BANNER_NONE
+    assert out["alarm_banner"] is not None
+
+
+def test_the_healthy_sentinel_does_not_read_as_an_alarm():
+    """`ALARM_BANNER_NONE` is a truthy string, so the reconciler has to compare
+    against it rather than rely on truthiness."""
+    b = _Broker()
+    for _ in range(m.ALERT_CLEAR_CONFIRM_CYCLES):
+        m._reconcile_alert_state(b, False, [], m.ALARM_BANNER_NONE)
+    assert _active(b) == "off", "a healthy banner must still clear the alert"
+
+
 # --------------------------------------------------------------------------
 # 2. Alert lifecycle: a banner alone must hold alert/active ON
 # --------------------------------------------------------------------------

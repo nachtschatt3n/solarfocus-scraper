@@ -85,6 +85,22 @@ ALARM_BANNER_TEXT_BBOX = (185, 8, 329, 24)
 # of the band, tight enough that grey chrome never reaches it.
 ALARM_BANNER_RED_FRACTION = 0.25
 
+# What the sensor reads when the heater is healthy.
+#
+# Publishing None here instead was a mistake: a None lands in neither `accepted`
+# nor `rejected`, so the healthy case counted as a MISSING field every cycle and
+# would have tripped FIELD_UNAVAILABLE_AFTER_CYCLES — leaving the brand-new
+# alarm sensor permanently `unavailable` in Home Assistant except during a
+# fault, and logging a field_unavailable transition for it. Worse, it made "no
+# alarm" and "OCR could not read the banner" indistinguishable in the logs, in
+# the very sensor added to close an observability gap.
+#
+# A concrete value avoids all of that, and it is honest: the colour gate makes
+# absence definitive rather than inferred, so we are not guessing when we say
+# this. An unreadable red band returns "Alarm (unreadable)" and never this.
+# Automations key off `state != "OK"`.
+ALARM_BANNER_NONE = "OK"
+
 # "Lagerraum befüllt" — the button the heater asks you to press after topping
 # up the pellet store. It is a text-labelled button on the probe screen, NOT
 # the acknowledge control in the alert dialog (see the SCREENS["alert_modal"]
@@ -3183,7 +3199,7 @@ def _ocr_all(img_by_screen: dict[str, Image.Image]) -> dict[str, object]:
     if main_img is not None:
         # Deliberately not in BBOXES: an unconditional OCR of this band would
         # publish chrome noise whenever there is no alarm. See alarm_banner_text.
-        out["alarm_banner"] = alarm_banner_text(main_img)
+        out["alarm_banner"] = alarm_banner_text(main_img) or ALARM_BANNER_NONE
     if FILL_BAR_REGION is not None:
         if main_img is not None:
             out["fill_level_percent"] = fill_level_percent(main_img)
@@ -3312,7 +3328,7 @@ def _reconcile_alert_state(broker: Optional[MqttBroker], dry_run: bool,
     if alerts:
         # _handle_alert_modal already published title/body and reset the streak.
         return
-    if banner:
+    if banner and banner != ALARM_BANNER_NONE:
         broker.note_alert_seen()
         broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "on", retain=True)
         broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/title", str(banner), retain=True)
