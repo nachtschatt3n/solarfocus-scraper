@@ -85,6 +85,24 @@ ALARM_BANNER_TEXT_BBOX = (185, 8, 329, 24)
 # of the band, tight enough that grey chrome never reaches it.
 ALARM_BANNER_RED_FRACTION = 0.25
 
+# "Lagerraum befüllt" — the button the heater asks you to press after topping
+# up the pellet store. It is a text-labelled button on the probe screen, NOT
+# the acknowledge control in the alert dialog (see the SCREENS["alert_modal"]
+# comment for how those two got confused).
+#
+# This is the one control we press on a human's explicit instruction, never on
+# our own initiative: it tells the boiler its store has been refilled, and
+# saying that falsely would have it auger into an empty room.
+LAGERRAUM_BEFUELLT_SCREEN = "automatische_saugsondenumschalteinheit"
+LAGERRAUM_BEFUELLT_XY = (109, 274)
+
+# A command is a one-shot instruction, not a state. Anything older than this is
+# dropped unexecuted: MQTT replays retained messages to new subscribers, and a
+# pod restart hours later must not resurrect a button press the operator made
+# this morning. The command topic is published non-retained for the same
+# reason; this is the belt to that suspenders.
+COMMAND_MAX_AGE_SECONDS = 900.0
+
 # Navigation as a state machine.
 #
 # Each `Screen` has a small distinctive region whose sha256 is the screen's
@@ -1755,6 +1773,11 @@ class MqttBroker:
         # Consecutive cycles that checked for an alert and found none. See the
         # ALERT LIFECYCLE note on _handle_alert_modal.
         self.alert_absent_streak: int = 0
+        # name -> monotonic timestamp of an operator command awaiting execution.
+        # Commands are executed by the CYCLE, never on this callback thread:
+        # VNC is serialised by COORD.try_begin_cycle(), so clicking from here
+        # would race whatever the in-flight cycle is doing on the panel.
+        self.pending_commands: dict[str, float] = {}
         self.last_values: dict[str, str] = {}  # field -> last retained value (string)
         self._lock = threading.Lock()
 
@@ -1815,6 +1838,7 @@ class MqttBroker:
         event(logging.INFO, "mqtt_connected", "MQTT connected", host=MQTT_HOST, port=MQTT_PORT)
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/scraper/pause")
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/scraper/pause/set")
+        client.subscribe(f"{MQTT_TOPIC_PREFIX}/command/+/set")
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/+")  # capture retained sensor values
 
     def _on_message(self, client, userdata, msg):
@@ -1826,6 +1850,22 @@ class MqttBroker:
         elif topic == f"{MQTT_TOPIC_PREFIX}/scraper/pause/set":
             normalized = "on" if payload.strip().lower() in ("on", "true", "1") else "off"
             client.publish(f"{MQTT_TOPIC_PREFIX}/scraper/pause", normalized, qos=0, retain=True)
+        elif (topic.startswith(f"{MQTT_TOPIC_PREFIX}/command/")
+              and topic.endswith("/set")):
+            name = topic[len(MQTT_TOPIC_PREFIX) + len("/command/"):-len("/set")]
+            if msg.retain:
+                # A retained command is a replay, not an instruction. Refusing
+                # it is the whole point of COMMAND_MAX_AGE_SECONDS' sibling
+                # guard — do not let a broker restart press a button.
+                event(logging.WARNING, "command_retained_ignored",
+                      "ignoring RETAINED command message — commands are "
+                      "one-shot and must be published non-retained",
+                      command=name)
+                return
+            with self._lock:
+                self.pending_commands[name] = time.monotonic()
+            event(logging.WARNING, "command_queued",
+                  "operator command queued for the next cycle", command=name)
         elif topic.startswith(f"{MQTT_TOPIC_PREFIX}/") and "/" not in topic[len(MQTT_TOPIC_PREFIX) + 1:]:
             field = topic[len(MQTT_TOPIC_PREFIX) + 1:]
             with self._lock:
@@ -1841,6 +1881,31 @@ class MqttBroker:
         with self._lock:
             self.alert_absent_streak += 1
             return self.alert_absent_streak
+
+    def take_pending_command(self, name: str) -> bool:
+        """Claim a queued command, if one is fresh enough to still be meant.
+
+        Single-shot by construction: the entry is removed whether or not it is
+        acted on, so a command that cannot be executed this cycle is dropped
+        rather than retried forever against a panel whose state has moved on.
+        """
+        with self._lock:
+            ts = self.pending_commands.pop(name, None)
+        if ts is None:
+            return False
+        age = time.monotonic() - ts
+        if age > COMMAND_MAX_AGE_SECONDS:
+            event(logging.WARNING, "command_expired",
+                  "dropping stale command without executing it",
+                  command=name, age_s=round(age, 1),
+                  max_age_s=COMMAND_MAX_AGE_SECONDS)
+            return False
+        return True
+
+    def publish_command_result(self, name: str, ok: bool, detail: str) -> None:
+        """Report what happened, so a button press is never silently swallowed."""
+        self.publish(f"{MQTT_TOPIC_PREFIX}/command/{name}/result",
+                     ("ok: " if ok else "refused: ") + detail, retain=True)
 
     def is_paused(self) -> bool:
         with self._lock:
@@ -1927,6 +1992,30 @@ def publish_discovery(broker: MqttBroker) -> None:
         "state_off": "off",
         "device": DEVICE_BLOCK,
     }, retain=True)
+
+    # "Lagerraum befüllt" button. A button, not a switch: it is a momentary
+    # instruction to the heater, with no state of its own to mirror.
+    btn_topic = f"{MQTT_DISCOVERY_PREFIX}/button/{MQTT_DEVICE_ID}/lagerraum_befuellt/config"
+    broker.publish(btn_topic, {
+        "name": "Lagerraum befüllt",
+        "unique_id": f"{MQTT_DEVICE_ID}_lagerraum_befuellt",
+        "object_id": f"{MQTT_DEVICE_ID}_lagerraum_befuellt",
+        "command_topic": f"{MQTT_TOPIC_PREFIX}/command/lagerraum_befuellt/set",
+        "payload_press": "press",
+        "icon": "mdi:silo",
+        "device": DEVICE_BLOCK,
+    }, retain=True)
+    # What happened to the last press. Without this a refused command looks
+    # identical to one that worked.
+    broker.publish(
+        f"{MQTT_DISCOVERY_PREFIX}/sensor/{MQTT_DEVICE_ID}/lagerraum_befuellt_result/config", {
+            "name": "Lagerraum befüllt Ergebnis",
+            "unique_id": f"{MQTT_DEVICE_ID}_lagerraum_befuellt_result",
+            "object_id": f"{MQTT_DEVICE_ID}_lagerraum_befuellt_result",
+            "state_topic": f"{MQTT_TOPIC_PREFIX}/command/lagerraum_befuellt/result",
+            "icon": "mdi:information-outline",
+            "device": DEVICE_BLOCK,
+        }, retain=True)
 
     # RETIRED: the "Clear Heater Service Alert" button and its alert/latched
     # topic. The manual latch assumed HA was the only place the operator would
@@ -3160,6 +3249,46 @@ def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
     return seen
 
 
+def _maybe_press_lagerraum_befuellt(client, broker: Optional[MqttBroker],
+                                    dry_run: bool, img: Image.Image) -> None:
+    """Press "Lagerraum befüllt", but only if a human asked and the panel agrees.
+
+    Called with the probe screen already captured and on screen. This is the
+    only place the scraper clicks a control that changes heater state, and it
+    does so exclusively on an explicit Home Assistant button press.
+
+    The guard: refuse when every probe still reads empty. Telling the boiler the
+    store is full when it is not is the one genuinely damaging thing this button
+    can do — it would send the auger back into an empty room, which is how alarm
+    14 ("max. Saugzeit erreicht") is raised in the first place. If the operator
+    has really just refilled, at least one probe reads full and the press goes
+    through; if none do, they almost certainly pressed the button before the
+    delivery, and the refusal (published to the result topic) tells them so.
+    """
+    if not broker or not broker.take_pending_command("lagerraum_befuellt"):
+        return
+    states = [probe_dot_state(img, region) for region in PROBE_DOT_REGIONS.values()]
+    known = [st for st in states if st is not None]
+    if known and not any(known):
+        detail = (f"all {len(known)} probes still read empty — refusing to tell "
+                  f"the boiler the store is full")
+        event(logging.WARNING, "lagerraum_befuellt_refused", detail)
+        broker.publish_command_result("lagerraum_befuellt", False, detail)
+        return
+    if dry_run:
+        broker.publish_command_result("lagerraum_befuellt", False, "dry run")
+        return
+    x, y = LAGERRAUM_BEFUELLT_XY
+    event(logging.WARNING, "lagerraum_befuellt_pressed",
+          "pressing 'Lagerraum befüllt' on operator command",
+          xy=[x, y], probes_full=sum(1 for st in known if st), probes_known=len(known))
+    vnc_click(client, x, y)
+    time.sleep(CLICK_DELAY_SECONDS)
+    broker.publish_command_result(
+        "lagerraum_befuellt", True,
+        f"pressed at {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+
+
 def _reconcile_alert_state(broker: Optional[MqttBroker], dry_run: bool,
                            alerts: list[dict], banner: object) -> None:
     """Decide what `alert/active` should say, given BOTH fault surfaces.
@@ -3444,6 +3573,11 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                     img = vnc_capture(client)
                     img_by_screen[screen_name] = img
                     COORD.update_after_capture(screen_name, img)
+                    # Operator commands run here, not on the MQTT thread: we
+                    # already hold the VNC slot and are already standing on the
+                    # right screen, so no extra navigation and no race.
+                    if screen_name == LAGERRAUM_BEFUELLT_SCREEN:
+                        _maybe_press_lagerraum_befuellt(client, broker, dry_run, img)
                 COORD.set_phase("ocr")
                 COORD.set_target(None)
                 v = _ocr_all(img_by_screen)
