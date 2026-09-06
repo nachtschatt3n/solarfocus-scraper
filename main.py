@@ -1854,6 +1854,7 @@ class MqttBroker:
         event(logging.INFO, "mqtt_connected", "MQTT connected", host=MQTT_HOST, port=MQTT_PORT)
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/scraper/pause")
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/scraper/pause/set")
+        client.subscribe(f"{MQTT_TOPIC_PREFIX}/+/available")
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/command/+/set")
         client.subscribe(f"{MQTT_TOPIC_PREFIX}/+")  # capture retained sensor values
 
@@ -1866,6 +1867,14 @@ class MqttBroker:
         elif topic == f"{MQTT_TOPIC_PREFIX}/scraper/pause/set":
             normalized = "on" if payload.strip().lower() in ("on", "true", "1") else "off"
             client.publish(f"{MQTT_TOPIC_PREFIX}/scraper/pause", normalized, qos=0, retain=True)
+        elif (topic.startswith(f"{MQTT_TOPIC_PREFIX}/")
+              and topic.endswith("/available")
+              and topic.count("/") == MQTT_TOPIC_PREFIX.count("/") + 2):
+            # Adopt the retained availability the broker is already holding.
+            # _FIELD_AVAILABLE is in-memory, so without this a restart has no
+            # idea a field was offline and re-announces it online.
+            field = topic[len(MQTT_TOPIC_PREFIX) + 1:-len("/available")]
+            _FIELD_AVAILABLE[field] = payload.strip().lower() == "online"
         elif (topic.startswith(f"{MQTT_TOPIC_PREFIX}/command/")
               and topic.endswith("/set")):
             name = topic[len(MQTT_TOPIC_PREFIX) + len("/command/"):-len("/set")]
@@ -1987,12 +1996,23 @@ def publish_discovery(broker: MqttBroker) -> None:
         if meta.state_class:
             cfg["state_class"] = meta.state_class
         broker.publish(topic, cfg, retain=True)
-        # Seed availability. HA holds an entity unavailable until it has SEEN an
-        # availability message, so without this every sensor would register as
-        # Unavailable and stay there until its first absence.
-        if _FIELD_AVAILABLE.get(field) is None:
-            _FIELD_AVAILABLE[field] = True
-            broker.publish(_field_availability_topic(field), "online", retain=True)
+        # Availability is deliberately NOT seeded here any more.
+        #
+        # It used to publish a retained "online" for every field whose in-memory
+        # state was unknown — which, because _FIELD_AVAILABLE is in-memory, is
+        # EVERY field on EVERY pod start. That overwrote the retained "offline"
+        # of a field that was legitimately unavailable, while its stale retained
+        # value was still sitting on the value topic. So each restart
+        # re-advertised stale readings as live for the ~3 cycles it took the
+        # streak to re-trip — the exact "serving a stale value as live" failure
+        # the availability work was built to end. It is also what made every
+        # restart emit a 46-field field_available burst.
+        #
+        # Nothing needs seeding: the availability topics are retained, so HA
+        # still has the last known state across a restart, and the first cycle
+        # publishes "online" for every field that actually reads (see run_cycle).
+        # A field that has genuinely never been seen stays unavailable until it
+        # reads once, which is the honest answer rather than an optimistic one.
 
     # pause switch
     sw_topic = f"{MQTT_DISCOVERY_PREFIX}/switch/{MQTT_DEVICE_ID}/pause/config"

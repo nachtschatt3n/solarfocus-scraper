@@ -679,15 +679,46 @@ def test_availability_topic_is_not_mistaken_for_a_sensor_value():
     assert "/" in rest, f"{t} would match the solarfocus/+ value subscription"
 
 
-def test_discovery_seeds_every_heater_field_online():
-    """HA holds an entity unavailable until it has seen an availability
-    message, so a fresh deploy must seed them or everything reads Unavailable."""
+def test_discovery_does_not_seed_availability():
+    """Was: "discovery seeds every heater field online". Inverted 2026-09-06,
+    and the original concern is preserved by the test below rather than lost.
+
+    The concern was real: HA holds an entity unavailable until it has seen an
+    availability message, so entities must not be stranded Unavailable. But
+    seeding at DISCOVERY was the wrong place to answer it. _FIELD_AVAILABLE is
+    in-memory, so "state unknown" is true of every field on every pod start —
+    the seed therefore published a retained "online" for all of them on every
+    restart, overwriting the retained "offline" of any field that was
+    legitimately unavailable while its stale value still sat on the value topic.
+    Each restart re-advertised stale readings as live for the ~3 cycles it took
+    the streak to re-trip, which is precisely the failure per-field availability
+    exists to prevent. Observed with fbh_vorlaufsolltemperatur holding a stale
+    33.0 marked online, and it is why every restart emitted a 46-field
+    field_available burst.
+
+    Nothing is stranded without the seed: availability topics are RETAINED, so a
+    restart inherits the true last state, and the first cycle publishes "online"
+    for every field that actually reads. The only behaviour change is on a
+    genuinely first-ever deploy, where entities read Unavailable for one cycle
+    (~90s) instead of being optimistically announced — which is the honest
+    answer, and a far better trade than minutes of stale-as-live on every
+    redeploy thereafter."""
     _reset_field_avail()
     b = _FakeBroker()
     m.publish_discovery(b)
     for field in m.SENSORS:
-        assert _avail_msgs(b, field) == ["online"], \
-            f"{field} not seeded online at discovery"
+        assert _avail_msgs(b, field) == [], \
+            f"{field} was seeded at discovery; availability must come from a read"
+
+
+def test_a_field_that_reads_becomes_available_without_any_seeding():
+    """The other half of the inverted test above: nothing is stranded, because
+    the first successful read is what publishes "online"."""
+    _reset_field_avail()
+    b = _FakeBroker()
+    m.publish_discovery(b)
+    m._publish_field_availability(b, False, "kesseltemperatur", online=True)
+    assert _avail_msgs(b, "kesseltemperatur") == ["online"]
 
 
 def _run() -> int:
