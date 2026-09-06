@@ -53,6 +53,38 @@ FIELD_PARAGRAPH = "--psm 6"
 ALERT_TITLE_BBOX = (20, 5, 600, 28)
 ALERT_BODY_BBOX  = (40, 140, 560, 180)
 
+# The red alarm banner in the `main` header, between the date and the clock —
+# the panel's "HotAlarm" band (manual: "jede Maske oben Mitte", though in
+# practice this firmware paints it on `main` only).
+#
+# This is a SECOND, independent fault surface, and conflating it with the
+# alert-modal machinery is what hid alarm 14 on 2026-09-06. A DIALOG is
+# transient: it pops when the fault fires and is gone once anyone backs out of
+# it, so `_handle_alert_modal` legitimately saw nothing and `alert/active`
+# honestly read `off`. The BANNER persists for as long as the fault does. If
+# you want Home Assistant to know the heater is in alarm, this is the surface
+# that has to be read -- the boiler sat switched off with an empty store for
+# over six hours and nothing was published, because we were only watching for
+# a dialog that had already been dismissed.
+ALARM_BANNER_BBOX = (145, 8, 369, 24)
+
+# The band splits into a message NUMBER and its text, and they need separate
+# OCR passes: across every framing tried, a single full-width --psm 7 read
+# silently drops the leading number ("14  max. Saug - Laufzeit erreicht" comes
+# back as "max. Saug - Laufzeit erreicht"), the same segmentation behaviour
+# that made outside_temperature and ww_ist_temp digit-only boxes. The number is
+# the stable identifier — text wording can change with firmware, "14" maps to
+# manual §5.8 forever — so it is worth the second pass.
+ALARM_BANNER_CODE_BBOX = (145, 8,  40, 24)
+ALARM_BANNER_TEXT_BBOX = (185, 8, 329, 24)
+
+# Fraction of the banner box that must be saturated red before we treat it as
+# present. Without alarms the same strip is plain grey header chrome, and
+# OCR'ing it unconditionally would publish noise; the colour test is what makes
+# absence unambiguous. 0.25 is loose enough for the white text that covers much
+# of the band, tight enough that grey chrome never reaches it.
+ALARM_BANNER_RED_FRACTION = 0.25
+
 # Navigation as a state machine.
 #
 # Each `Screen` has a small distinctive region whose sha256 is the screen's
@@ -154,8 +186,29 @@ SCREENS: dict[str, Screen] = {
     # OK button, which on the inset variant is empty gap between two buttons at
     # x[20,184] and x[452,616] (incident 2026-08-16). Worse, a fixed coordinate
     # cannot tell an inert pixel from an ACTION button: the inset dialog's
-    # bottom-right button is "Lagerraum befüllt", and clicking it to escape
-    # would have falsified the heater's pellet-store state.
+    # bottom-right button is the acknowledge ("quittieren") control, and
+    # clicking it to escape would have released the boiler to retry the very
+    # fault it was reporting.
+    #
+    # CORRECTED 2026-09-06. This comment, and two others below, previously
+    # named that button "Lagerraum befüllt". That was wrong, and worth spelling
+    # out because it is what any future click logic would reason from. The
+    # service manual settles it: Abb. 93 (Alarmstatistik) captions the pair
+    # "warning triangle + green check = Alarme quittieren", "triangle + red X =
+    # delete inactive alarms", and Abb. 11 — the dialog for THIS heater's
+    # alarm 14 "MAXIMALE SAUGZEIT ERREICHT!" — carries the same triangle+check
+    # control, as does Abb. 10 for an STB fault where a pellet-store button
+    # would be meaningless. The glyph is generic across alarm dialogs.
+    #
+    # The real "Lagerraum befüllt" is a separate, text-labelled button on the
+    # `automatische_saugsondenumschalteinheit` screen, centred (109, 274). The
+    # Pelletsmangel dialog's body text points the operator AT THAT SCREEN
+    # ("Nach der Neubefüllung ist der Button 'Lagerraum befüllt' zu
+    # betätigen!"), which is almost certainly how the mix-up started.
+    #
+    # The refusal below was and remains correct — only its stated reason was
+    # wrong. Both buttons are state-changing and neither is ours to press
+    # autonomously.
     #
     # The hash below is an exact-match fast path for ONE alert's layout, kept
     # only because it is free. It is NOT a fingerprint across alerts: the box
@@ -792,6 +845,10 @@ SENSORS: dict[str, SensorMeta] = {
     "kesseltemperatur":     SensorMeta("Kesseltemperatur", "°C", "temperature", "measurement"),
     "restsauerstoffgehalt": SensorMeta("Restsauerstoffgehalt", "%", None, "measurement"),
     "status_text":          SensorMeta("Status"),
+    # The red header banner. Distinct from "Status" (the blue strip, which just
+    # reads "Alarm aktiv!") because this one names WHICH fault, e.g.
+    # "14 max. Saug - Laufzeit erreicht".
+    "alarm_banner":         SensorMeta("Alarm"),
     # "Brenner Füllstand" (was "Pellets Füllstand") — this is the burner's
     # internal hopper that the Saugaustragung suction system tops up; not the
     # silo level. The new name disambiguates it from the storage tank.
@@ -1174,6 +1231,37 @@ def parse_value(raw: str, kind: str) -> Optional[float | int | str]:
     except ValueError:
         return None
 
+def alarm_banner_text(img: Image.Image) -> Optional[str]:
+    """Return the text of the red header alarm banner, or None when no alarm
+    is being displayed.
+
+    Presence is decided by COLOUR, not by whether OCR produced something: the
+    same strip is grey header chrome when the heater is healthy, and tesseract
+    will happily hallucinate a few characters out of chrome and antialiasing.
+    Gating on red keeps "no alarm" a hard, unambiguous answer.
+
+    The text is white-on-red, so it needs the same inversion as the blue status
+    line. The return value mirrors what the panel shows — "14 max. Saug -
+    Laufzeit erreicht" — with the code omitted if only the text reads, and vice
+    versa, so a partial OCR still surfaces something actionable rather than
+    nothing.
+    """
+    band = crop(img, ALARM_BANNER_BBOX).convert("RGB")
+    px = list(band.get_flattened_data())
+    if not px:
+        return None
+    red = sum(1 for p in px if _px_banner_red(p))
+    if red / len(px) < ALARM_BANNER_RED_FRACTION:
+        return None
+    code = ocr(img, ALARM_BANNER_CODE_BBOX, FIELD_NUM, invert=True).strip()
+    text = ocr(img, ALARM_BANNER_TEXT_BBOX, FIELD_TEXT, invert=True).strip()
+    parts = [p for p in (code, text) if p]
+    if not parts:
+        # Red band with no readable content: still an alarm, and saying so is
+        # better than reporting "no alarm" because OCR had a bad frame.
+        return "Alarm (unreadable)"
+    return " ".join(parts)
+
 def fill_level_percent(img: Image.Image) -> Optional[float]:
     if FILL_BAR_REGION is None or any(v is None for v in FILL_BAR_REGION):
         return None
@@ -1244,6 +1332,12 @@ def _px_navy(p) -> bool:
     the bright blue of the action buttons (`_px_button_blue`)."""
     r, g, b = p[:3]
     return b > 45 and r < 110 and g < 125 and b - r > 25 and b >= g
+
+def _px_banner_red(p) -> bool:
+    """Saturated red of the header alarm band."""
+    r, g, b = p[:3]
+    return r > 150 and r - g > 80 and r - b > 80
+
 
 def _px_button_blue(p) -> bool:
     """Bright blue of a Solarfocus push-button face."""
@@ -1391,7 +1485,8 @@ def _find_modal_back_arrow(px, icon: tuple[int, int, int, int], width: int,
 
     The search box is pinned well left of the icon and level with it, so the
     bottom action buttons — which also carry yellow glyphs, e.g. the warning
-    triangle on "Lagerraum befüllt" — are structurally out of reach."""
+    triangle on the acknowledge ("quittieren") control — are structurally out
+    of reach."""
     ix0, iy0, ix1, iy1 = icon
     x_max = ix0 - 100
     if x_max <= 0:
@@ -2995,8 +3090,12 @@ def _ocr_all(img_by_screen: dict[str, Image.Image]) -> dict[str, object]:
         out[field] = parsed
         event(logging.DEBUG, "ocr_result", "ocr value",
               field=field, engine=spec.engine, raw=raw, parsed=parsed)
+    main_img = img_by_screen.get("main")
+    if main_img is not None:
+        # Deliberately not in BBOXES: an unconditional OCR of this band would
+        # publish chrome noise whenever there is no alarm. See alarm_banner_text.
+        out["alarm_banner"] = alarm_banner_text(main_img)
     if FILL_BAR_REGION is not None:
-        main_img = img_by_screen.get("main")
         if main_img is not None:
             out["fill_level_percent"] = fill_level_percent(main_img)
     saug_img = img_by_screen.get("saugaustragung")
@@ -3036,8 +3135,11 @@ def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
             broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/body", body, retain=True)
             broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/last_seen", alert["ts"], retain=True)
         # Dismiss via the dialog's own geometry — its back arrow when it has
-        # one, else a single centred OK button. Never an action button: this
-        # dialog's bottom-right button is "Lagerraum befüllt".
+        # one, else a single centred OK button. Never an action button: an
+        # alarm dialog's bottom-right button is the acknowledge ("quittieren")
+        # control, which releases the boiler to retry the reported fault.
+        # Acknowledging is a human decision, exposed as an explicit Home
+        # Assistant button, never taken autonomously here.
         xy = _dismiss_xy_for(img, "alert_modal")
         if xy is None:
             event(logging.ERROR, "alert_not_dismissable",
@@ -3056,6 +3158,52 @@ def _handle_alert_modal(client, broker: Optional[MqttBroker], dry_run: bool,
         vnc_click(client, *xy)
         time.sleep(CLICK_DELAY_SECONDS)
     return seen
+
+
+def _reconcile_alert_state(broker: Optional[MqttBroker], dry_run: bool,
+                           alerts: list[dict], banner: object) -> None:
+    """Decide what `alert/active` should say, given BOTH fault surfaces.
+
+    The heater reports a fault two independent ways, and only reading one of
+    them is what let alarm 14 go unnoticed for six hours on 2026-09-06:
+
+      - a DIALOG, handled by _handle_alert_modal. Transient: it pops when the
+        fault fires and is gone once anyone (including us) backs out of it.
+      - the red header BANNER on `main`. Persists for as long as the fault does.
+
+    So "no dialog this cycle" is not the same as "no alarm", and the old code
+    treated it as such. A banner therefore holds `alert/active` on and refreshes
+    the title, and only the absence of BOTH surfaces starts the clear countdown.
+
+    The ALERT_CLEAR_CONFIRM_CYCLES streak is preserved unchanged: one missed
+    detection still cannot flap the sensor off and back on.
+    """
+    if not broker or dry_run:
+        return
+    if alerts:
+        # _handle_alert_modal already published title/body and reset the streak.
+        return
+    if banner:
+        broker.note_alert_seen()
+        broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "on", retain=True)
+        broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/title", str(banner), retain=True)
+        # No body: the banner is the whole message. Publishing empty rather
+        # than leaving a previous dialog's body attached to a different alarm.
+        broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/body", "", retain=True)
+        return
+    # Neither surface shows anything. Only clear once the absence has repeated,
+    # so a single missed detection cannot flap the sensor. Title and body are
+    # cleared with the flag — a retained title against active=off reads as a
+    # live alert in HA and was its own small lie.
+    streak = broker.note_alert_absent()
+    if streak == ALERT_CLEAR_CONFIRM_CYCLES:
+        broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "off", retain=True)
+        broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/title", "", retain=True)
+        broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/body", "", retain=True)
+        event(logging.INFO, "alert_cleared",
+              "no alert dialog and no header banner for %d consecutive cycles "
+              "— clearing" % ALERT_CLEAR_CONFIRM_CYCLES,
+              confirm_cycles=ALERT_CLEAR_CONFIRM_CYCLES)
 
 
 def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
@@ -3256,27 +3404,16 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
             final_status, final_error = "busy", str(e)
             return CycleResult(status="busy", values={})
 
+        alerts: list[dict] = []
         try:
             # First, dismiss any alert modal(s) currently on screen. These pop
             # over any screen and block navigation until OK is clicked. The
             # helper publishes each one to MQTT before dismissing.
             COORD.set_phase("alerts")
             alerts = _handle_alert_modal(client, broker, dry_run)
-            if broker and not dry_run and not alerts:
-                # This cycle checked and found no dialog. Only clear once the
-                # absence has repeated, so a single missed detection cannot
-                # flap the sensor off and back on. Title and body are cleared
-                # together with the flag — a retained title against active=off
-                # reads as a live alert in HA and was its own small lie.
-                streak = broker.note_alert_absent()
-                if streak == ALERT_CLEAR_CONFIRM_CYCLES:
-                    broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/active", "off", retain=True)
-                    broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/title", "", retain=True)
-                    broker.publish(f"{MQTT_TOPIC_PREFIX}/alert/body", "", retain=True)
-                    event(logging.INFO, "alert_cleared",
-                          "no alert dialog for %d consecutive cycles — clearing"
-                          % ALERT_CLEAR_CONFIRM_CYCLES,
-                          confirm_cycles=ALERT_CLEAR_CONFIRM_CYCLES)
+            # The clear/keep decision is NOT made here any more. It needs the
+            # red header banner, which is only read once the screens have been
+            # captured — see _reconcile_alert_state() below.
 
             screens_needed = sorted({spec.screen for spec in BBOXES.values()} | {"main"})
 
@@ -3375,6 +3512,10 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
                 client.disconnect()
             except Exception:
                 pass
+
+        # Now that the screens have been read, `alert/active` can be judged
+        # against both fault surfaces rather than the dialog alone.
+        _reconcile_alert_state(broker, dry_run, alerts, values.get("alarm_banner"))
 
         # Partial publish: skip rejected fields, publish the rest. One stuck
         # OCR field must not freeze the other 33. `sanity_failed` is reserved
