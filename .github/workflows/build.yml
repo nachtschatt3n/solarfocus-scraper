@@ -50,12 +50,22 @@ jobs:
 
       # tests/ is deliberately not COPYed into the runtime image — mounting it
       # keeps the shipped image free of test code. Bytecode writing and the
-      # pytest cache are disabled so the read-only mount is enough.
+      # pytest cache are disabled so the read-only mounts are enough.
+      #
+      # docs/screenshots must be mounted too, and it is not optional padding:
+      # CORPUS_DIRS spans both directories, and the false-positive guard in
+      # test_screen_recognition.py asserts the committed corpus is at least 10
+      # screens. Without docs/ the container sees 6 and the guard fails — which
+      # is exactly what the first gated run did, and it is the right failure:
+      # a corpus that silently shrinks is a weakened guard, and that guard
+      # exists because a false-positive modal detection taps an unknown
+      # coordinate on a live heater.
       - name: Run test suite inside the image
         run: |
           docker run --rm --user root \
             -e PYTHONDONTWRITEBYTECODE=1 \
             -v "${{ github.workspace }}/tests:/app/tests:ro" \
+            -v "${{ github.workspace }}/docs:/app/docs:ro" \
             solarfocus-scraper:test \
             sh -c "pip install --no-cache-dir --quiet pytest \
                    && python -m pytest -q -p no:cacheprovider /app/tests"
