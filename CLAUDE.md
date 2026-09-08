@@ -16,7 +16,12 @@
 > - the **OCR pipeline** (unit-glyph bbox exclusion, LCD/Otsu), the
 >   **screenshot-fixture regression suite** in `tests/` (run
 >   `python tests/test_screen_recognition.py` or `pytest tests/`; needs
->   tesseract `deu`) plus how to verify OCR/sanity changes by observation, and
+>   tesseract `deu`, **Python 3.12 and Pillow 12.3.0** — the pixel-level tests
+>   raise `AttributeError: get_flattened_data` on Pillow 11, and tesseract
+>   5.3.x decodes small digit glyphs differently from the pinned 5.5.0, so a
+>   venv that drifts from the image tests something other than production; CI
+>   now runs the suite *inside* the built image for exactly this reason) plus
+>   how to verify OCR/sanity changes by observation, and
 >   the retained-MQTT baseline wipe order;
 > - the **build/deploy pipeline** (push → GHCR image → cberg-agent bumps the
 >   Flux `image.tag`), and the **cross-agent seam**: cluster/Flux/ops →
