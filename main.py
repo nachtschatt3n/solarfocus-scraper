@@ -585,7 +585,34 @@ SANITY_BOUNDS: dict[str, tuple[float, float]] = {
     "pelletsbetrieb_h":               (0, 1_000_000),
     "anzahl_kesselstarts":            (0, 1_000_000),
     "betriebsstunden_seit_wartung_h": (0, 1_000_000),
-    "pelletsverbrauch_kg":            (0, 10_000_000),
+    # Lower bound 10_000 (not 0) is the same protection the tight bounds give
+    # ww_ist_temp and puffer_temp_top, applied to the one counter that feeds
+    # real accounting.
+    #
+    # These run-meters are bounded (0, 1_000_000) because they grow without
+    # limit — which means the bounds layer can NEVER fire for them, and the
+    # invariant that protects every other field ("a bounds failure never
+    # advances the delta confirmation counter") gives them nothing. That is
+    # exactly the hole that let einschub_h round-trip 10x four times in 21 days
+    # and corrupt its Home Assistant long-term statistics badly enough to need
+    # a 241-adjustment recorder repair (2026-09-08).
+    #
+    # pelletsverbrauch_kg does not need the wide range. It is a lifetime fuel
+    # total, currently ~16_350 kg and rising ~4_000 kg/year, so 10_000 is far
+    # below anything reachable by a correct read and 100_000 is ~20 years out.
+    # A dropped leading digit (16_348 -> 6_348) or a swallowed decimal
+    # (1_634.8) now fails BOUNDS rather than reaching the 3-cycle delta
+    # override, so it can never be confirmed into the baseline.
+    #
+    # Prophylactic: this field has never actually misread. It is narrowed
+    # because it is the number the pellet meters, the Energy dashboard and the
+    # buy-signal all ultimately rest on, and it is the one counter where a
+    # confirmed misread would be expensive rather than merely wrong.
+    #
+    # If the boiler or its counter is ever replaced and this resets near zero,
+    # every read will be rejected until the lower bound is dropped — loudly,
+    # in the logs, rather than silently.
+    "pelletsverbrauch_kg":            (10_000, 100_000),
     # Lower bound 10 (not -10) keeps OCR misreads where Tesseract drops
     # the leading digit of a 2-digit value ("44" → "4") from sneaking past
     # the delta_override breaker. Buffer tanks don't run below ~10°C in
