@@ -662,6 +662,55 @@ COUNTER_FIELDS: set[str] = {
 # the test decisive — see _counter_scale_repair().
 COUNTER_SCALE_FACTORS: tuple[float, ...] = (10.0, 100.0, 1000.0)
 
+# How many decimals each counter actually SHOWS on the panel. A repair may not
+# invent precision the display does not have.
+#
+# Learned the hard way (2026-09-24 review, 699 repairs in production): the /10
+# repairs were right (5645 -> 564.5), but 512 /100 repairs were not. They
+# published saugaustragung_h as 567.51 / 571.01 on a counter that displays one
+# decimal, and rla_pumpe_h as 31883.2 on one that displays whole hours. Those
+# raw reads were not dropped decimal points at all — most likely a stray
+# trailing glyph — and dividing by 100 turned a misread into a plausible-looking
+# wrong value. Being slightly too HIGH, each one then made the next correct
+# read look like a decrease and get rejected.
+#
+# Whole-hour counters are excluded from repair entirely: with no decimal point
+# on the display there is none to drop, so the premise of the repair does not
+# hold, and a 10x read there is left to COUNTER_IMPLAUSIBLE_RATIO to reject.
+# Screen evidence: docs/screenshots/screen-betriebsstunden-p3.png shows
+# RLA-Pumpe / OG / Fussbodenheizung as whole hours; every other counter seen in
+# production carries at most one decimal.
+COUNTER_DISPLAY_DECIMALS: dict[str, int] = {
+    "rla_pumpe_h": 0,
+    "og_h": 0,
+    "fussbodenheizung_h": 0,
+    "anzahl_kesselstarts": 0,
+}
+COUNTER_DEFAULT_DISPLAY_DECIMALS = 1
+
+# The decrease breaker (_DECREASE_CONFIRM) exists to unwind a baseline that was
+# inflated by a misread. It must not accept an arbitrary drop just because the
+# same wrong digits came back three times: the panel often does not redraw
+# between cycles, so OCR sees the same pixels and three identical reads are NOT
+# independent confirmation. On 2026-09-15 that is exactly how rla_pumpe_h
+# 31883 -> 31834 (an 83->34 digit misread, -49 h) was accepted and served to
+# Home Assistant for 17.5 h, corrupting its long-term statistics.
+#
+# So only a SMALL decrease is confirmable — this many per-cycle delta budgets.
+# Anything larger is rejected every cycle and never counted. That is safe only
+# because COUNTER_PHYSICAL_TIME_MARGIN_H below stops an upward misread from
+# inflating an hour meter in the first place; without it, a large inflation
+# could never be unwound.
+COUNTER_MAX_CONFIRMABLE_DECREASE_BUDGETS = 2.0
+
+# An hour meter cannot advance faster than wall-clock time. When the upward
+# breaker is about to confirm an out-of-budget reading on a *_h counter, the
+# advance is capped at the hours actually elapsed since the value was last
+# accepted, plus this margin for whole-hour display rounding. Unlike the
+# per-cycle budget this bound is exact and uncapped, so a genuine catch-up after
+# an arbitrarily long outage still gets through, while a stable misread cannot.
+COUNTER_PHYSICAL_TIME_MARGIN_H = 2.0
+
 # A counter read at least this many times its own baseline is not a reading,
 # it is a misparse: an hour meter reaching 5x its previous value in one cycle
 # would mean tens of thousands of hours elapsed since the last scrape.
@@ -846,12 +895,18 @@ def _counter_scale_repair(field: str, val: float, prev: float) -> Optional[float
     words, we accept the repair only when inserting a decimal point turns an
     impossible reading into an unremarkable one.
 
-    Verified against all four occurrences observed in production:
+    Repairs as observed in production:
 
-        saugaustragung_h  557.4  -> 55751.0  ->  557.51  (/100, +0.11)
         saugaustragung_h  557.81 ->  5586.0  ->  558.6   (/10,  +0.79)
         einschub_h       6594.4  -> 65945.0  -> 6594.5   (/10,  +0.10)
         einschub_h       6597.4  -> 65975.0  -> 6597.5   (/10,  +0.10)
+
+    Deliberately NOT repaired (see COUNTER_DISPLAY_DECIMALS):
+
+        saugaustragung_h  557.4  -> 55751.0  -/-> 557.51  two decimals on a
+            one-decimal display; almost certainly a trailing glyph, not a
+            dropped point. The original version of this docstring listed it as
+            a verified /100 repair — it was the first instance of the bug.
 
     Returns None for in-budget values (nothing to repair), for non-integral
     reads (a dropped '.' always yields an integer), and for anything whose
@@ -860,6 +915,10 @@ def _counter_scale_repair(field: str, val: float, prev: float) -> Optional[float
     """
     base = MAX_DELTA_PER_CYCLE.get(field)
     if base is None or prev <= 0 or val <= prev:
+        return None
+    decimals = COUNTER_DISPLAY_DECIMALS.get(field, COUNTER_DEFAULT_DISPLAY_DECIMALS)
+    if decimals == 0:
+        # No decimal point on the display, so none can have been swallowed.
         return None
     # A swallowed decimal point always produces a whole number.
     if val != int(val):
@@ -872,7 +931,11 @@ def _counter_scale_repair(field: str, val: float, prev: float) -> Optional[float
         # `candidate >= prev` keeps the repair monotonic: we never invent a
         # decrease, which would only trip the monotonicity guard downstream.
         if candidate >= prev and abs(candidate - prev) <= allowed:
-            return round(candidate, 3)
+            # Reject candidates finer than the display can show: 55751/100 =
+            # 557.51 is not a reading a one-decimal panel can produce.
+            if round(candidate, decimals) != round(candidate, 6):
+                continue
+            return round(candidate, decimals)
     return None
 
 # Deadlock-breaker for legitimate large changes. If a field reads the same (≈)
@@ -3476,6 +3539,17 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
                         # if the field reads consistently lower for N cycles,
                         # the inflated baseline is wrong and the new value
                         # should be accepted as truth.
+                        max_drop = (MAX_DELTA_PER_CYCLE.get(field, 0.0)
+                                    * COUNTER_MAX_CONFIRMABLE_DECREASE_BUDGETS)
+                        if max_drop and prev - val > max_drop:
+                            # Too large to be the unwinding of a small
+                            # inflation; a steady misread, not a correction.
+                            # See COUNTER_MAX_CONFIRMABLE_DECREASE_BUDGETS.
+                            _DECREASE_CONFIRM.pop(field, None)
+                            rejected[field] = (
+                                f"{val} decreased from {prev} by {prev - val:g} "
+                                f"(> {max_drop:g}; not confirmable)")
+                            continue
                         if allow_delta_override:
                             tracked = _DECREASE_CONFIRM.get(field)
                             if tracked and abs(val - tracked[0]) <= DECREASE_CONFIRM_TOLERANCE:
@@ -3523,6 +3597,19 @@ def _sanity_check(values: dict[str, object], broker: Optional[MqttBroker],
                             f"(counter cannot exceed {COUNTER_IMPLAUSIBLE_RATIO:g}x; "
                             f"not confirmable)")
                         continue
+                    if (over and allow_delta_override and field in COUNTER_FIELDS
+                            and field.endswith("_h")):
+                        accepted_ts = _LAST_ACCEPTED_TS.get(field)
+                        if accepted_ts is not None:
+                            elapsed_h = max(0.0, time.time() - accepted_ts) / 3600.0
+                            physical_max = elapsed_h + COUNTER_PHYSICAL_TIME_MARGIN_H
+                            if val - prev > physical_max:
+                                _DELTA_CONFIRM.pop(field, None)
+                                rejected[field] = (
+                                    f"{val} advances {val - prev:g} h from prev={prev} "
+                                    f"in {elapsed_h:.1f} h elapsed (hour meter cannot "
+                                    f"outrun the clock; not confirmable)")
+                                continue
                     if over and allow_delta_override:
                         tol = max(1.0, max_delta * 0.1)
                         tracked = _DELTA_CONFIRM.get(field)

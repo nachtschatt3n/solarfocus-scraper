@@ -66,7 +66,9 @@ def _reset():
 
 # (field, previous published value, misread, expected repair)
 PRODUCTION_CASES = [
-    ("saugaustragung_h", 557.4, 55751.0, 557.51),
+    # ("saugaustragung_h", 557.4, 55751.0, 557.51) used to lead this list. It
+    # was wrong: 557.51 has two decimals on a one-decimal display. See
+    # test_no_repair_finer_than_the_display below.
     ("saugaustragung_h", 557.81, 5586.0, 558.6),
     ("einschub_h", 6594.4, 65945.0, 6594.5),
     ("einschub_h", 6597.4, 65975.0, 6597.5),
