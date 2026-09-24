@@ -3320,6 +3320,40 @@ def navigate_to(client, target: str, max_steps: int = 12) -> bool:
     event(logging.ERROR, "navigate_max_steps", "exhausted steps", target=target)
     return False
 
+# Fields that display exactly one decimal and whose physical range sits far
+# below ten times its upper bound, so a whole-number read ABOVE the bound can
+# only be the decimal point dropped.
+#
+# restsauerstoffgehalt: residual O2, displayed "7.4 %", physically <= 21 %,
+# bounded (0, 25). During burns OCR regularly drops the point — 74, 78, 90, 91,
+# 98 observed (29 rejections in 14 days to 2026-09-24). Bounds rejected every
+# one and the value was discarded, so HA kept showing the standby 21 % through
+# the burn and "the boiler is not burning" read far more often than true.
+#
+# Only values ABOVE the bound are touched, so an in-range reading — including
+# the standby 21 — is never reinterpreted. The repaired value still goes
+# through the full sanity pipeline (a 21 -> 7.4 step still has to clear the
+# delta gate), so this recovers readings; it does not bypass any check.
+DROPPED_DECIMAL_ONE_PLACE: frozenset[str] = frozenset({"restsauerstoffgehalt"})
+
+
+def _repair_dropped_decimal(field: str, parsed: object) -> object:
+    """Restore a single dropped decimal point on a one-decimal field when, and
+    only when, the whole-number read is impossible and its tenth is not."""
+    if field not in DROPPED_DECIMAL_ONE_PLACE or isinstance(parsed, bool):
+        return parsed
+    if not isinstance(parsed, (int, float)) or parsed != int(parsed):
+        return parsed
+    lo, hi = SANITY_BOUNDS[field]
+    if hi < parsed <= hi * 10 and lo <= parsed / 10 <= hi:
+        repaired = round(parsed / 10, 1)
+        event(logging.INFO, "dropped_decimal_repaired",
+              "one-decimal field read without its point — restoring it",
+              field=field, raw=parsed, value=repaired)
+        return repaired
+    return parsed
+
+
 def _ocr_all(img_by_screen: dict[str, Image.Image]) -> dict[str, object]:
     out: dict[str, object] = {}
     for field, spec in BBOXES.items():
@@ -3331,7 +3365,7 @@ def _ocr_all(img_by_screen: dict[str, Image.Image]) -> dict[str, object]:
             raw = ocr_digits_template(img, spec.bbox)
         else:
             raw = ocr(img, spec.bbox, spec.config, invert=spec.invert, lcd=spec.lcd)
-        parsed = parse_value(raw, spec.kind)
+        parsed = _repair_dropped_decimal(field, parse_value(raw, spec.kind))
         out[field] = parsed
         event(logging.DEBUG, "ocr_result", "ocr value",
               field=field, engine=spec.engine, raw=raw, parsed=parsed)
