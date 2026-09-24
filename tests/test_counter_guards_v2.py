@@ -67,9 +67,35 @@ def _run(field, prev, val, cycles=m.DELTA_CONFIRM_THRESHOLD + 2):
 # --------------------------------------------------------------------------
 
 def test_no_repair_finer_than_the_display():
-    """The 557.51 case that the first version of the repair got wrong."""
+    """The first repair published 557.51 / 571.11 — two decimals on a
+    one-decimal display. Whatever it returns now, it is never that."""
     _reset()
-    assert m._counter_scale_repair("saugaustragung_h", 55751.0, 557.4) is None
+    for raw, prev in ((55751.0, 557.4), (57111.0, 571.0), (56751.0, 567.4)):
+        got = m._counter_scale_repair("saugaustragung_h", raw, prev)
+        assert got is None or round(got, 1) == got, got
+
+
+def test_the_live_0924_misread_recovers_the_true_value():
+    """Panel showed "571.1 h"; OCR read 57111 on 5 of 5 reads. Rejecting it
+    would freeze the counter for as long as the panel shows that value."""
+    _reset()
+    assert m._counter_scale_repair("saugaustragung_h", 57111.0, 571.0) == 571.1
+    assert m._counter_scale_repair("saugaustragung_h", 57111.0, 571.1) == 571.1 or \
+        m._counter_scale_repair("saugaustragung_h", 57111.0, 571.1) is None
+
+
+def test_every_historical_extra_glyph_read_resolves_to_one_decimal():
+    """The raws the /100 path got 0.01 wrong, now resolved to what the panel
+    actually showed."""
+    _reset()
+    assert m._counter_scale_repair("saugaustragung_h", 55751.0, 557.4) == 557.5
+    assert m._counter_scale_repair("saugaustragung_h", 56751.0, 567.4) == 567.5
+
+
+def test_an_ambiguous_read_is_refused_not_guessed():
+    """57101 against 571.0 fits both 571.0 and 571.1. The pixels cannot tell
+    us which; publishing either would be a coin toss."""
+    _reset()
     assert m._counter_scale_repair("saugaustragung_h", 57101.0, 571.0) is None
 
 

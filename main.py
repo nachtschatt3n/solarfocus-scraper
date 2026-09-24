@@ -926,16 +926,37 @@ def _counter_scale_repair(field: str, val: float, prev: float) -> Optional[float
     allowed, _ = _delta_allowance(field, base)
     if abs(val - prev) <= allowed:
         return None                      # plausible as-is; not our business
+
+    def _ok(candidate: float) -> bool:
+        # Monotonic (never invent a decrease), within the normal budget, and no
+        # finer than the display can show — 557.51 is not a reading a
+        # one-decimal panel can produce.
+        return (candidate >= prev and candidate - prev <= allowed
+                and round(candidate, decimals) == round(candidate, 6))
+
+    candidates: set[float] = set()
+    # (a) The decimal point was simply swallowed: 65945 -> 6594.5.
     for scale in COUNTER_SCALE_FACTORS:
-        candidate = val / scale
-        # `candidate >= prev` keeps the repair monotonic: we never invent a
-        # decrease, which would only trip the monotonicity guard downstream.
-        if candidate >= prev and abs(candidate - prev) <= allowed:
-            # Reject candidates finer than the display can show: 55751/100 =
-            # 557.51 is not a reading a one-decimal panel can produce.
-            if round(candidate, decimals) != round(candidate, 6):
-                continue
-            return round(candidate, decimals)
+        if _ok(val / scale):
+            candidates.add(round(val / scale, decimals))
+    # (b) The decimal point was lost AND one extra glyph appeared. Confirmed
+    # from a live capture on 2026-09-24: the panel showed "571.1 h" and OCR
+    # returned 57111 on 5 of 5 reads. The same one-extra-glyph shape explains
+    # every raw the earlier /100 path mis-repaired (55751, 56751, 57101,
+    # 57111), which is why /100 kept producing values 0.01 too high. Try
+    # deleting each single digit and restoring the point.
+    digits = str(int(val))
+    if len(digits) >= 3:
+        for i in range(len(digits)):
+            candidate = int(digits[:i] + digits[i + 1:]) / (10 ** decimals)
+            if _ok(candidate):
+                candidates.add(round(candidate, decimals))
+    # Exactly one plausible reading, or none. Two different values that both
+    # fit (57101 against 571.0 -> 571.0 or 571.1) mean the pixels do not tell
+    # us which is true; refusing leaves the last good value in place, which is
+    # safer than publishing a coin toss.
+    if len(candidates) == 1:
+        return candidates.pop()
     return None
 
 # Deadlock-breaker for legitimate large changes. If a field reads the same (≈)
