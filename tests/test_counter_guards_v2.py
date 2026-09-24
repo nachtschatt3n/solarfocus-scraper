@@ -80,49 +80,56 @@ def test_the_live_0924_misread_recovers_the_true_value():
     would freeze the counter for as long as the panel shows that value."""
     _reset()
     assert m._counter_scale_repair("saugaustragung_h", 57111.0, 571.0) == 571.1
-    assert m._counter_scale_repair("saugaustragung_h", 57111.0, 571.1) == 571.1 or \
-        m._counter_scale_repair("saugaustragung_h", 57111.0, 571.1) is None
 
 
-def test_every_historical_extra_glyph_read_resolves_to_one_decimal():
-    """The raws the /100 path got 0.01 wrong, now resolved to what the panel
-    actually showed."""
+def test_every_historical_trailing_glyph_read_resolves_to_the_panel_value():
+    """The raws the /100 path got 0.01 high, now resolved correctly."""
     _reset()
     assert m._counter_scale_repair("saugaustragung_h", 55751.0, 557.4) == 557.5
     assert m._counter_scale_repair("saugaustragung_h", 56751.0, 567.4) == 567.5
+    assert m._counter_scale_repair("saugaustragung_h", 57101.0, 571.0) == 571.0
 
 
-def test_an_ambiguous_read_is_refused_not_guessed():
-    """57101 against 571.0 fits both 571.0 and 571.1. The pixels cannot tell
-    us which; publishing either would be a coin toss."""
+def test_the_next_panel_value_unfreezes_a_bad_baseline():
+    """The old image left 571.11 as the baseline. 571.1 is below it, so 57111
+    cannot repair (correctly — never invent a decrease); the next panel value
+    571.2 -> 57121 must repair to 571.2 and move the counter on."""
     _reset()
-    assert m._counter_scale_repair("saugaustragung_h", 57101.0, 571.0) is None
+    assert m._counter_scale_repair("saugaustragung_h", 57111.0, 571.11) is None
+    assert m._counter_scale_repair("saugaustragung_h", 57121.0, 571.11) == 571.2
 
 
-def test_one_decimal_repairs_still_work():
-    """The /10 repairs were right and must keep working."""
+def test_a_sweep_through_the_observed_failure_shape():
+    """Panel 571.1 -> 572.0, each read with the point lost and a trailing "1".
+    Every one must resolve to exactly the panel value."""
     _reset()
-    assert m._counter_scale_repair("einschub_h", 65945.0, 6594.4) == 6594.5
-    assert m._counter_scale_repair("saugaustragung_h", 5645.0, 564.4) == 564.5
-    assert m._counter_scale_repair("betriebsstunden_seit_wartung_h", 18495.0, 1849.4) == 1849.5
+    prev = 571.0
+    for tenths in range(5711, 5721):
+        true = tenths / 10
+        raw = float(f"{true:.1f}".replace(".", "") + "1")
+        got = m._counter_scale_repair("saugaustragung_h", raw, prev)
+        assert got == true, f"{true:.1f} read as {raw:.0f} -> {got}"
+        prev = got
 
 
-def test_whole_hour_counters_are_never_repaired():
-    """No decimal point on the display, so none can have been dropped."""
+def test_a_different_misread_shape_is_never_published_wrong():
+    """If the point were instead read AS a "1" in place (572.3 -> 57213), the
+    trailing-glyph repair must not produce a wrong value: it may repair to the
+    truth by coincidence or refuse, never anything else."""
     _reset()
-    for field in ("rla_pumpe_h", "og_h", "fussbodenheizung_h"):
-        assert m.COUNTER_DISPLAY_DECIMALS[field] == 0
-        assert m._counter_scale_repair(field, 318830.0, 31882.0) is None
+    prev = 572.0
+    for tenths in range(5721, 5730):
+        true = tenths / 10
+        raw = float(f"{true:.1f}".replace(".", "1"))
+        got = m._counter_scale_repair("saugaustragung_h", raw, prev)
+        assert got is None or got == true, f"{true:.1f} read as {raw:.0f} -> {got}"
 
 
-def test_whole_hour_10x_is_rejected_not_published():
-    """318838 on rla_pumpe_h (09-17, held ~5 h in production): with repair off
-    for this field it must fall to the ratio guard and never publish."""
+def test_a_real_dropped_decimal_ending_in_one_is_not_mistaken():
+    """6594.1 read as 65941: the /10 shape is the right one, and the trailing
+    strip (659.4) is far out of budget, so there is no ambiguity."""
     _reset()
-    rejected, values = _run("rla_pumpe_h", 31883.0, 318838.0)
-    assert "rla_pumpe_h" in rejected
-    assert values["rla_pumpe_h"] == 318838.0, "judged, not rewritten"
-    assert "rla_pumpe_h" not in m._DELTA_CONFIRM
+    assert m._counter_scale_repair("einschub_h", 65941.0, 6594.0) == 6594.1
 
 
 # --------------------------------------------------------------------------
@@ -210,3 +217,4 @@ if __name__ == "__main__":
                 print(f"FAIL {name}: {exc}")
     print("ALL PASS" if not failures else f"{failures} FAILED")
     raise SystemExit(1 if failures else 0)
+

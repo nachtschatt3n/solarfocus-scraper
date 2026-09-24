@@ -939,22 +939,31 @@ def _counter_scale_repair(field: str, val: float, prev: float) -> Optional[float
     for scale in COUNTER_SCALE_FACTORS:
         if _ok(val / scale):
             candidates.add(round(val / scale, decimals))
-    # (b) The decimal point was lost AND one extra glyph appeared. Confirmed
-    # from a live capture on 2026-09-24: the panel showed "571.1 h" and OCR
-    # returned 57111 on 5 of 5 reads. The same one-extra-glyph shape explains
-    # every raw the earlier /100 path mis-repaired (55751, 56751, 57101,
-    # 57111), which is why /100 kept producing values 0.01 too high. Try
-    # deleting each single digit and restoring the point.
+    # (b) The decimal point was lost AND a trailing "1" was appended.
+    #
+    # Established from the raws, not guessed. Of the two models that fit the
+    # live capture (panel "571.1 h" -> OCR 57111, 5 of 5 reads), only this one
+    # also fits every historical read the old /100 path mis-repaired:
+    #
+    #     raw     prev    trailing "1"   point read as "1"
+    #     55751   557.4   557.5          557.1  (decrease - impossible)
+    #     56751   567.4   567.5          567.1  (decrease - impossible)
+    #     57101   571.0   571.0          570.1  (decrease - impossible)
+    #     57111   571.0   571.1          571.1
+    #
+    # which is also exactly why /100 was always 0.01 high: it kept the stray
+    # glyph as a second decimal. Kept deliberately narrow — an earlier
+    # version deleted ANY single digit and found two plausible readings for
+    # most values, which would have frozen the counter just the same.
     digits = str(int(val))
-    if len(digits) >= 3:
-        for i in range(len(digits)):
-            candidate = int(digits[:i] + digits[i + 1:]) / (10 ** decimals)
-            if _ok(candidate):
-                candidates.add(round(candidate, decimals))
-    # Exactly one plausible reading, or none. Two different values that both
-    # fit (57101 against 571.0 -> 571.0 or 571.1) mean the pixels do not tell
-    # us which is true; refusing leaves the last good value in place, which is
-    # safer than publishing a coin toss.
+    if len(digits) >= 3 and digits.endswith("1"):
+        candidate = int(digits[:-1]) / (10 ** decimals)
+        if _ok(candidate):
+            candidates.add(round(candidate, decimals))
+
+    # The two shapes cannot both fit — (a) lands near 10x the true value — so
+    # more than one candidate means something else is going on. Refuse rather
+    # than pick.
     if len(candidates) == 1:
         return candidates.pop()
     return None
