@@ -107,3 +107,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # The shipped image must never replay the `apt-get upgrade` layer
+          # from the GHA cache: re-resolve the base tag and rebuild the stage
+          # uncached, or a rebuild ships the same stale Debian packages. This
+          # matters more because the Scheduled Rebuild's weekly-* tags are not
+          # what the cluster pins — the push build IS the deployed artifact.
+          pull: true
+          no-cache-filters: base
