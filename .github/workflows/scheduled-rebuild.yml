@@ -44,9 +44,19 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Compute date tag
+      # Tag shape. The cluster pins `sha-<7 hex>` — the shape build.yml's
+      # metadata-action publishes on push. This workflow used to publish
+      # `sha-<40 hex>`, which nothing could ever pin, so its rebuilds were
+      # never deployable. Publish `sha-<7>-b<YYYYMMDD>` instead: same commit
+      # prefix the cluster already pins, plus a build-date suffix (the
+      # rebuild-lane shape gods-eye-view uses, `<version>-b<YYYYMMDD>`).
+      # The push-built `sha-<7>` tag is deliberately NOT overwritten: a pinned
+      # tag must not change content underneath the cluster.
+      - name: Compute tags
         id: date
-        run: echo "tag=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "tag=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(echo "$GITHUB_SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
       - name: Build & push (no-cache so base + apt are fresh)
         uses: docker/build-push-action@v6
@@ -59,7 +69,7 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:weekly
             ${{ env.IMAGE }}:weekly-${{ steps.date.outputs.tag }}
-            ${{ env.IMAGE }}:sha-${{ github.sha }}
+            ${{ env.IMAGE }}:sha-${{ steps.date.outputs.sha }}-b${{ steps.date.outputs.tag }}
 
       - name: Trivy scan (informational — does not fail the build)
         # Pin to a v-prefixed tag — aquasecurity yanked the un-prefixed `0.28.0`
