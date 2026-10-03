@@ -2340,7 +2340,8 @@ class Coordinator:
         # Indexed by screen name. Populated on every successful capture so that
         # `/screenshot/<screen>.png` can serve the latest image of that screen.
         self.per_screen_captures: dict[str, tuple[bytes, float]] = {}
-        # The capture each field last FAILED to read from, keyed by field.
+        # The capture each field last FAILED to read from — read nothing, or
+        # read a value the sanity pipeline rejected — keyed by field.
         #
         # per_screen_captures is overwritten every cycle, so the frame behind an
         # intermittent OCR miss is gone within one interval — which is why
@@ -3904,6 +3905,15 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
         # Now that the screens have been read, `alert/active` can be judged
         # against both fault surfaces rather than the dialog alone.
         _reconcile_alert_state(broker, dry_run, alerts, values.get("alarm_banner"))
+        # A REJECTED read is as worth seeing as a missing one: ww_ist_temp read
+        # 4-8 °C against bounds of [20, 90] and was held back for 6 h on
+        # 2026-10-02 — a wrong number, not an empty one, so the None path never
+        # recorded its frame. The retry pass recaptures every screen, so the
+        # capture on hand is the one that produced the final rejected value.
+        for f in rejected:
+            spec = BBOXES.get(f)
+            if spec is not None:
+                COORD.record_miss(f, spec.screen)
 
         # Partial publish: skip rejected fields, publish the rest. One stuck
         # OCR field must not freeze the other 33. `sanity_failed` is reserved
