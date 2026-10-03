@@ -2340,6 +2340,17 @@ class Coordinator:
         # Indexed by screen name. Populated on every successful capture so that
         # `/screenshot/<screen>.png` can serve the latest image of that screen.
         self.per_screen_captures: dict[str, tuple[bytes, float]] = {}
+        # The capture each field last FAILED to read from, keyed by field.
+        #
+        # per_screen_captures is overwritten every cycle, so the frame behind an
+        # intermittent OCR miss is gone within one interval — which is why
+        # og_vorlauftemperatur (missing ~0.7% of cycles while its row is on
+        # screen, unlike og_vorlaufsolltemperatur whose row legitimately
+        # vanishes) went unfixed: nobody could ever see a failing frame. Served
+        # at /screenshot/miss/<field>.png. Holds a reference to the PNG that was
+        # already encoded at capture time, so a miss costs nothing to record,
+        # and memory is bounded by the number of fields.
+        self.miss_captures: dict[str, tuple[bytes, float, str]] = {}
         # Field values + recording timestamps
         self.values: dict[str, ValueRecord] = {}
 
@@ -2397,6 +2408,18 @@ class Coordinator:
     def get_screen_png(self, screen: str) -> Optional[tuple[bytes, float]]:
         with self.state_lock:
             return self.per_screen_captures.get(screen)
+
+    def record_miss(self, field: str, screen: str) -> None:
+        """Remember the frame `field` just failed to read from."""
+        with self.state_lock:
+            entry = self.per_screen_captures.get(screen)
+            if entry is not None:
+                png, ts = entry
+                self.miss_captures[field] = (png, ts, screen)
+
+    def get_miss_png(self, field: str) -> Optional[tuple[bytes, float, str]]:
+        with self.state_lock:
+            return self.miss_captures.get(field)
 
     def record_value(self, field: str, value: object) -> None:
         with self.state_lock:
@@ -2931,6 +2954,18 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 self._send(404, "text/plain", b"no screenshot yet\n")
             else:
                 self._send(200, "image/png", png)
+        elif path.startswith("/screenshot/miss/") and path.endswith(".png"):
+            # /screenshot/miss/<field>.png — the frame that field last failed to
+            # read from. Must precede the /screenshot/<screen> branch, which
+            # would otherwise take "miss/<field>" as a screen name.
+            field = path[len("/screenshot/miss/"):-len(".png")]
+            entry = COORD.get_miss_png(field)
+            if entry is None:
+                self._send(404, "text/plain",
+                           f"no failed read recorded for field={field}\n".encode())
+            else:
+                png, _ts, _screen = entry
+                self._send(200, "image/png", png)
         elif path.startswith("/screenshot/") and path.endswith(".png"):
             # /screenshot/<screen>.png — latest capture of a named screen. Useful
             # for diagnosing per-screen OCR issues without waiting for that
@@ -3367,6 +3402,8 @@ def _ocr_all(img_by_screen: dict[str, Image.Image]) -> dict[str, object]:
             raw = ocr(img, spec.bbox, spec.config, invert=spec.invert, lcd=spec.lcd)
         parsed = _repair_dropped_decimal(field, parse_value(raw, spec.kind))
         out[field] = parsed
+        if parsed is None:
+            COORD.record_miss(field, spec.screen)
         event(logging.DEBUG, "ocr_result", "ocr value",
               field=field, engine=spec.engine, raw=raw, parsed=parsed)
     main_img = img_by_screen.get("main")
