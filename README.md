@@ -82,6 +82,32 @@ That refusal is load-bearing, not fastidiousness: the PELLETSMANGEL dialog's bot
 
 Tesseract runs on 2× LANCZOS-upscaled crops. Per-field config picks between `--psm 7` with a `0123456789,.-` whitelist (for numeric values) and `--psm 7` in German mode (for status strings). Status-text fields set `invert=True` — grayscale conversion + inversion turns the white-on-blue status bars into the black-on-white text Tesseract vastly prefers.
 
+### UI-language guard
+
+Every recogniser here assumes the heater's touchscreen is in **German**. If the
+UI language flips, navigation stops recognising screens and cycles die as a
+generic `navigation_failed`. The guard names that cause:
+
+- **Detect** — frames `navigate_to` cannot identify are classified from OCR of
+  the title bar + body: `german` (any German anchor; always wins), `foreign`
+  (no German, a whole-word match in `FOREIGN_ANCHORS`), `suspect` (readable text,
+  no German, language unknown) or `indeterminate`. `UI_LANGUAGE_FOREIGN_CONFIRMATIONS`
+  (3) consecutive foreign frames confirm; any German frame resets.
+  `FOREIGN_ANCHORS` is **not yet verified against a real English capture** — extend it
+  the next time the UI flips.
+- **Fail loud** — ERROR event `ui_language_not_german` (or `ui_language_suspect`),
+  metrics `solarfocus_scraper_ui_language_{german,state,frames_total,reassert_total}`,
+  retained `<prefix>/scraper/ui_language` (`german|non_german|suspect|reassert_halted`).
+  The cycle still returns no values, so nothing degraded is published.
+- **Reassert (opt-in, no path shipped)** — the menu path to the language selector is
+  operator-supplied JSON in `UI_LANGUAGE_REASSERT_STEPS`
+  (`[{"label","xy":[x,y],"anchor_region":[x,y,w,h],"anchor_any":[...]|"anchor_hash":[...]}]`),
+  mode `UI_LANGUAGE_REASSERT=off|dry-run|on` (default `dry-run`, which never clicks).
+  Rails: start from `main`; fresh capture must match each step's anchor before its
+  click; verification by re-OCR; at most 2 attempts per episode (persisted in
+  `UI_LANGUAGE_STATE_FILE`, survives restarts), >= 10 min apart; then a hard stop
+  until a German frame is observed.
+
 ### Coordinator
 
 A single `Coordinator` singleton owns all runtime state. `run_cycle()` gates on `try_begin_cycle()` so a second concurrent caller returns `busy` immediately — two scheduled cycles cannot overlap, and nothing from the web UI can race the scheduler. State mutations take a short-held lock at phase boundaries (*connecting → navigating → ocr → publishing → done*); the HTTP handler snapshots under the same lock so the UI reflects in-flight progress rather than stale values.

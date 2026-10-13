@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -3028,6 +3029,7 @@ class CycleResult:
     status: str  # ok | navigation_failed | busy | sanity_failed | paused
     values: dict[str, object]
     error_image_b64: Optional[str] = None
+    error: Optional[str] = None  # short machine tag, e.g. ui_language_not_german
 
 
 class _NavFail(Exception):
@@ -3258,6 +3260,405 @@ def _dismiss_xy_for(img: Image.Image, screen: str) -> Optional[tuple[int, int]]:
     return modal.dismiss_xy
 
 
+# =============================================================================
+# UI-language guard
+# =============================================================================
+# Incident 2026-10-11..13: the heater touchscreen's UI language flipped away
+# from German. Every recogniser in this file keys off German text (header
+# hashes, `ocr_text` anchors, the deu OCR model), so the scraper did not fail
+# in one place — navigation simply stopped recognising anything, and the cycle
+# died as a generic `navigation_failed`, indistinguishable from a jammed modal
+# or an offline heater. It was fixed by hand on the touchscreen.
+#
+# Three separate jobs, kept separate on purpose:
+#
+#   1. DETECT   classify_ui_language() reads a capture and says german /
+#               foreign / suspect / indeterminate. German anchors win ties, so
+#               a German screen can never be reported foreign. "foreign" needs
+#               a positively-recognised non-German word, not merely the absence
+#               of German; mere absence is only ever "suspect" (alert, no click).
+#   2. FAIL LOUD  a confirmed foreign UI is an ERROR event, a metric and a
+#               retained MQTT state, every cycle until it clears. Nothing is
+#               published as a reading: a navigation failure already returns no
+#               values, so degraded data cannot leak out of this path.
+#   3. REASSERT  optionally walk the touchscreen's language-selection path back
+#               to German. NO CLICK PATH IS SHIPPED. The path through the
+#               heater's menus has not been captured anywhere in this repo (no
+#               settings screen fixture, no edge to one), and guessing taps on
+#               a physical boiler is exactly what this guard exists to avoid.
+#               The path is therefore operator-supplied data
+#               (UI_LANGUAGE_REASSERT_STEPS) and the machinery refuses to run
+#               without one. See _reassert_ui_language() for the safety rails.
+UI_LANGUAGE_FOREIGN_CONFIRMATIONS = int(env("UI_LANGUAGE_FOREIGN_CONFIRMATIONS", "3"))
+UI_LANGUAGE_SUSPECT_CONFIRMATIONS = int(env("UI_LANGUAGE_SUSPECT_CONFIRMATIONS", "5"))
+# off     — detect + alert only
+# dry-run — as above, and log what a reassert WOULD do; never clicks (default)
+# on      — click the configured path, bounded as described below
+UI_LANGUAGE_REASSERT_MODE = env("UI_LANGUAGE_REASSERT", "dry-run").strip().lower()
+# Hard ceiling: the env knob can lower this, never raise it above 2.
+UI_LANGUAGE_REASSERT_HARD_MAX_ATTEMPTS = 2
+UI_LANGUAGE_REASSERT_MAX_ATTEMPTS = max(
+    0, min(int(env("UI_LANGUAGE_REASSERT_MAX_ATTEMPTS", "2")), UI_LANGUAGE_REASSERT_HARD_MAX_ATTEMPTS))
+# Minimum spacing between attempts, so two attempts can never be back-to-back
+# clicks and a crash-looping pod cannot burn the budget in a minute.
+UI_LANGUAGE_REASSERT_MIN_INTERVAL_SECONDS = float(env("UI_LANGUAGE_REASSERT_MIN_INTERVAL_SECONDS", "600"))
+UI_LANGUAGE_REASSERT_STEPS_RAW = env("UI_LANGUAGE_REASSERT_STEPS", "")
+UI_LANGUAGE_STATE_FILE = Path(env(
+    "UI_LANGUAGE_STATE_FILE",
+    str(Path(tempfile.gettempdir()) / "solarfocus-ui-language-episode.json")))
+
+SCREEN_WIDTH, SCREEN_HEIGHT = 640, 480
+
+# Bands OCR'd to classify a frame: the title bar (right of the back arrow), and
+# the body. Text is read with the German model — it is Latin-script, so English
+# words still come through; no extra tesseract language pack is needed.
+LANG_PROBE_BANDS = ((85, 2, 555, 36), (0, 60, 640, 380))
+
+# Whole-word matches on German vocabulary taken from the labels this scraper
+# already depends on. Matched as substrings (compound words), lower-cased.
+GERMAN_ANCHORS: tuple[str, ...] = (
+    "auswahl", "kunden", "betriebsstunden", "saugaustragung", "saugzug", "kessel",
+    "heizkreis", "trinkwasser", "warmwasser", "fussboden", "fußboden", "vorlauf",
+    "puffer", "anforderung", "pelletsbetrieb", "wartung", "sauerstoff", "zündung",
+    "absenk", "schnecke", "ascheaustrag", "lagerraum", "sollwert",
+)
+# NOT verified against a real English UI capture — none exists in this repo.
+# These are the English words the manufacturer's translations plausibly use;
+# whole-word matching only. Deliberately excludes words that are also German or
+# survive OCR of a German umlaut ("menu" vs "menü", "status", "service",
+# "pellets"). Extend from a real capture the next time the UI flips.
+FOREIGN_ANCHORS: tuple[str, ...] = (
+    "selection", "customer", "boiler", "operating", "hours", "heating", "circuit",
+    "water", "tank", "suction", "buffer", "temperature", "setpoint", "mixer",
+    "cleaning", "ignition", "storage", "counter", "probe", "language",
+)
+LANG_GERMAN, LANG_FOREIGN, LANG_SUSPECT, LANG_INDETERMINATE = (
+    "german", "foreign", "suspect", "indeterminate")
+
+def _lang_words(text: str) -> list[str]:
+    return re.findall(r"[a-zäöüß]+", text.lower())
+
+def classify_ui_language(img: Image.Image) -> str:
+    """Classify the UI language of one capture.
+
+    german        — at least one German anchor present (always wins).
+    foreign       — no German anchor, >=1 whole-word FOREIGN_ANCHORS match.
+    suspect       — no German anchor, no foreign anchor, but a substantial amount
+                    of readable text: it is *something* other than the German UI,
+                    just not a language we can name. Alerts; never triggers clicks.
+    indeterminate — little or no text (blank/torn frame, icon-only screen).
+
+    Info modals are NOT classified here — callers handle them first, since their
+    German body text is irrelevant to the UI language setting.
+    """
+    chunks: list[str] = []
+    for band in LANG_PROBE_BANDS:
+        try:
+            chunks.append(ocr(img, band, FIELD_PARAGRAPH, lang="deu"))
+        except Exception as e:
+            event(logging.DEBUG, "ui_language_ocr_failed", "OCR failed", error=str(e))
+    text = " ".join(chunks).lower()
+    if any(a in text for a in GERMAN_ANCHORS):
+        return LANG_GERMAN
+    words = _lang_words(text)
+    if any(w in FOREIGN_ANCHORS for w in words):
+        return LANG_FOREIGN
+    if sum(len(w) for w in words if len(w) >= 4) >= 24:
+        return LANG_SUSPECT
+    return LANG_INDETERMINATE
+
+m_ui_lang_ok = Gauge(
+    "solarfocus_scraper_ui_language_german",
+    "1 if the last language evidence was German, 0 if a non-German UI is confirmed "
+    "(unset until the first evidence)")
+m_ui_lang_state = Gauge(
+    "solarfocus_scraper_ui_language_state",
+    "One-hot UI-language state: german | foreign | suspect | reassert_halted",
+    ["state"])
+m_ui_lang_frames = Counter(
+    "solarfocus_scraper_ui_language_frames_total",
+    "Frames classified by the UI-language detector", ["klass"])
+m_ui_lang_reassert = Counter(
+    "solarfocus_scraper_ui_language_reassert_total",
+    "UI-language reassert outcomes: not_configured | invalid_config | dry_run | disabled | "
+    "throttled | aborted_not_on_main | aborted_anchor | attempted | recovered | not_recovered | halted",
+    ["result"])
+for _s in ("german", "foreign", "suspect", "reassert_halted"):
+    m_ui_lang_state.labels(state=_s).set(0)
+
+class UiLanguageTracker:
+    """Consecutive-evidence counter shared by navigate_to and the nav-fail hook.
+
+    Same idiom as the sanity layer's delta breaker: one odd frame proves
+    nothing; N consecutive agreeing frames do, and any German frame resets."""
+    def __init__(self) -> None:
+        self.foreign = 0
+        self.suspect = 0
+        self.last = None  # type: Optional[str]
+
+    def note(self, klass: str) -> None:
+        m_ui_lang_frames.labels(klass=klass).inc()
+        if klass == LANG_GERMAN:
+            self.foreign = self.suspect = 0
+            m_ui_lang_ok.set(1)
+            self._one_hot("german")
+            _episode_reset_on_german()
+        elif klass == LANG_FOREIGN:
+            self.foreign += 1
+        elif klass == LANG_SUSPECT:
+            self.suspect += 1
+        # indeterminate: neither confirms nor clears anything.
+        self.last = klass
+
+    @property
+    def confirmed_foreign(self) -> bool:
+        return self.foreign >= UI_LANGUAGE_FOREIGN_CONFIRMATIONS
+
+    @property
+    def confirmed_suspect(self) -> bool:
+        return (not self.confirmed_foreign
+                and self.suspect + self.foreign >= UI_LANGUAGE_SUSPECT_CONFIRMATIONS)
+
+    @staticmethod
+    def _one_hot(state: str) -> None:
+        for s in ("german", "foreign", "suspect"):
+            m_ui_lang_state.labels(state=s).set(1 if s == state else 0)
+
+LANG_TRACKER = UiLanguageTracker()
+
+# --- reassert episode budget (persisted, so a pod restart cannot reset it) ---
+def _episode_load() -> dict:
+    try:
+        d = json.loads(UI_LANGUAGE_STATE_FILE.read_text())
+        return {"attempts": int(d.get("attempts", 0)), "last_ts": float(d.get("last_ts", 0.0)),
+                "halted": bool(d.get("halted", False))}
+    except (OSError, ValueError, TypeError):
+        return {"attempts": 0, "last_ts": 0.0, "halted": False}
+
+def _episode_save(ep: dict) -> bool:
+    try:
+        UI_LANGUAGE_STATE_FILE.write_text(json.dumps(ep))
+        return True
+    except OSError as e:
+        event(logging.ERROR, "ui_language_state_unwritable",
+              "cannot persist the reassert budget — refusing to click without it",
+              path=str(UI_LANGUAGE_STATE_FILE), error=str(e))
+        return False
+
+def _episode_reset_on_german() -> None:
+    """A verified German frame ends the episode and restores the click budget."""
+    ep = _episode_load()
+    if ep["attempts"] or ep["halted"]:
+        event(logging.INFO, "ui_language_episode_cleared",
+              "German UI observed — language episode closed, reassert budget restored",
+              previous_attempts=ep["attempts"], was_halted=ep["halted"])
+        _episode_save({"attempts": 0, "last_ts": 0.0, "halted": False})
+    m_ui_lang_state.labels(state="reassert_halted").set(0)
+
+@dataclass
+class LangStep:
+    xy: tuple[int, int]
+    anchor_region: tuple[int, int, int, int]
+    anchor_any: tuple[str, ...]
+    anchor_hash: tuple[str, ...]
+    label: str
+
+def load_reassert_steps(raw: str) -> tuple[Optional[list[LangStep]], str]:
+    """Parse + validate UI_LANGUAGE_REASSERT_STEPS (JSON list).
+
+    Returns (steps, reason). steps=None with reason 'not_configured' when empty,
+    'invalid_config' when anything is off. Validation is strict because a bad
+    coordinate here is a click on a physical boiler: every step needs an
+    in-screen tap point, an in-screen anchor region, and at least one anchor
+    (OCR words and/or region hashes) to verify BEFORE the click."""
+    if not raw.strip():
+        return None, "not_configured"
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, list) or not data:
+            return None, "invalid_config"
+        steps: list[LangStep] = []
+        for d in data:
+            x, y = (int(v) for v in d["xy"])
+            ax, ay, aw, ah = (int(v) for v in d["anchor_region"])
+            any_ = tuple(str(s).lower() for s in d.get("anchor_any", []))
+            hashes = tuple(str(s).lower() for s in d.get("anchor_hash", []))
+            if not (0 <= x < SCREEN_WIDTH and 0 <= y < SCREEN_HEIGHT):
+                return None, "invalid_config"
+            if not (aw > 0 and ah > 0 and ax >= 0 and ay >= 0
+                    and ax + aw <= SCREEN_WIDTH and ay + ah <= SCREEN_HEIGHT):
+                return None, "invalid_config"
+            if not any_ and not hashes:
+                return None, "invalid_config"
+            steps.append(LangStep((x, y), (ax, ay, aw, ah), any_, hashes,
+                                  str(d.get("label", f"step{len(steps)}"))))
+        return steps, "ok"
+    except (KeyError, ValueError, TypeError):
+        return None, "invalid_config"
+
+def _anchor_ok(img: Image.Image, step: LangStep) -> bool:
+    if step.anchor_hash and region_hash(img, step.anchor_region) in step.anchor_hash:
+        return True
+    if step.anchor_any:
+        try:
+            text = ocr(img, step.anchor_region, FIELD_TEXT, lang="deu").lower()
+        except Exception:
+            return False
+        return any(a in text for a in step.anchor_any)
+    return False
+
+def _reassert_ui_language(client, steps_raw: Optional[str] = None,
+                          mode: Optional[str] = None) -> str:
+    """Try to drive the touchscreen back to German. Returns the outcome label.
+
+    Rails, all of which must hold before any click:
+      * mode is 'on' (default is dry-run) and a validated path is configured;
+      * the episode budget (<= 2 attempts, persisted) is not spent or halted,
+        and the last attempt was >= MIN_INTERVAL ago;
+      * the attempt is persisted BEFORE the first click, so a crash mid-walk
+        still counts;
+      * we start from `main` (language-independent version-string hash);
+      * every single click is preceded by a fresh capture that must match that
+        step's anchor — mismatch aborts the attempt with zero further clicks;
+      * after the path, success is judged by re-OCR: navigate_to(auswahlmenue)
+        only returns True if the German header is actually recognised.
+    After max attempts without recovery: halted, loud, no more clicks until a
+    German frame is observed (which can only come from an operator fix)."""
+    mode = UI_LANGUAGE_REASSERT_MODE if mode is None else mode
+    steps, reason = load_reassert_steps(
+        UI_LANGUAGE_REASSERT_STEPS_RAW if steps_raw is None else steps_raw)
+    if mode == "off":
+        m_ui_lang_reassert.labels(result="disabled").inc()
+        return "disabled"
+    if steps is None:
+        m_ui_lang_reassert.labels(result=reason).inc()
+        event(logging.ERROR, "ui_language_reassert_unavailable",
+              "UI language is not German and no usable reassert path is configured — "
+              "operator must switch the language on the touchscreen",
+              reason=reason)
+        return reason
+    ep = _episode_load()
+    if ep["halted"] or ep["attempts"] >= UI_LANGUAGE_REASSERT_MAX_ATTEMPTS:
+        ep["halted"] = True
+        _episode_save(ep)
+        m_ui_lang_state.labels(state="reassert_halted").set(1)
+        m_ui_lang_reassert.labels(result="halted").inc()
+        event(logging.ERROR, "ui_language_reassert_halted",
+              "language reassert budget spent — NOT clicking again; operator must fix "
+              "the language on the touchscreen",
+              attempts=ep["attempts"])
+        return "halted"
+    if mode != "on":
+        m_ui_lang_reassert.labels(result="dry_run").inc()
+        event(logging.WARNING, "ui_language_reassert_dry_run",
+              "dry-run: would reassert German via the configured path (no clicks sent)",
+              steps=[{"label": s.label, "xy": list(s.xy)} for s in steps],
+              attempts_used=ep["attempts"])
+        return "dry_run"
+    if time.time() - ep["last_ts"] < UI_LANGUAGE_REASSERT_MIN_INTERVAL_SECONDS:
+        m_ui_lang_reassert.labels(result="throttled").inc()
+        return "throttled"
+
+    ep = {"attempts": ep["attempts"] + 1, "last_ts": time.time(), "halted": False}
+    if not _episode_save(ep):           # no persisted budget -> no clicks
+        return "aborted_no_state"
+    m_ui_lang_reassert.labels(result="attempted").inc()
+    event(logging.WARNING, "ui_language_reassert_attempt",
+          "attempting to restore German UI", attempt=ep["attempts"],
+          of=UI_LANGUAGE_REASSERT_MAX_ATTEMPTS)
+
+    if not navigate_to(client, "main"):
+        m_ui_lang_reassert.labels(result="aborted_not_on_main").inc()
+        event(logging.ERROR, "ui_language_reassert_aborted",
+              "could not reach main before the language path — no language clicks sent")
+        return "aborted_not_on_main"
+    for i, step in enumerate(steps):
+        img = vnc_capture(client)
+        if not _anchor_ok(img, step):
+            m_ui_lang_reassert.labels(result="aborted_anchor").inc()
+            event(logging.ERROR, "ui_language_reassert_aborted",
+                  "anchor check failed before click — aborting attempt, no further clicks",
+                  step=i, label=step.label, xy=list(step.xy))
+            return "aborted_anchor"
+        event(logging.WARNING, "ui_language_reassert_click", "language path click",
+              step=i, label=step.label, xy=list(step.xy))
+        vnc_click(client, *step.xy)
+        time.sleep(CLICK_DELAY_SECONDS)
+    # Verification by re-OCR: only a recognised German header counts.
+    recovered = navigate_to(client, "auswahlmenue")
+    if recovered:
+        m_ui_lang_reassert.labels(result="recovered").inc()
+        event(logging.WARNING, "ui_language_reassert_recovered",
+              "German UI verified by re-OCR", attempt=ep["attempts"])
+        LANG_TRACKER.note(LANG_GERMAN)
+        return "recovered"
+    m_ui_lang_reassert.labels(result="not_recovered").inc()
+    event(logging.ERROR, "ui_language_reassert_not_recovered",
+          "language path completed but German header not recognised",
+          attempt=ep["attempts"], of=UI_LANGUAGE_REASSERT_MAX_ATTEMPTS)
+    if ep["attempts"] >= UI_LANGUAGE_REASSERT_MAX_ATTEMPTS:
+        ep["halted"] = True
+        _episode_save(ep)
+        m_ui_lang_state.labels(state="reassert_halted").set(1)
+        m_ui_lang_reassert.labels(result="halted").inc()
+        event(logging.ERROR, "ui_language_reassert_halted",
+              "language reassert failed twice — HARD STOP, no more clicks",
+              attempts=ep["attempts"])
+        return "halted"
+    return "not_recovered"
+
+_ui_lang_published: Optional[str] = None
+
+def _publish_ui_language(broker: Optional[MqttBroker], dry_run: bool, state: str) -> None:
+    """Retained `<prefix>/scraper/ui_language`: german | non_german | suspect |
+    reassert_halted. Published on change only, so a healthy scraper adds no
+    steady traffic."""
+    global _ui_lang_published
+    if not broker or dry_run or state == _ui_lang_published:
+        return
+    broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/ui_language", state, retain=True)
+    _ui_lang_published = state
+
+def ui_language_after_cycle_ok(broker: Optional[MqttBroker], dry_run: bool) -> None:
+    """A cycle that navigated every screen by its German anchors proves German."""
+    _publish_ui_language(broker, dry_run, "german")
+
+def ui_language_after_nav_fail(client, broker: Optional[MqttBroker], dry_run: bool) -> Optional[str]:
+    """Called from the nav-fail path. Raises the alarm and (if configured) tries
+    to reassert. Returns a short tag for the cycle error text, or None when the
+    language is not implicated."""
+    t = LANG_TRACKER
+    tag: Optional[str] = None
+    if t.confirmed_foreign:
+        m_ui_lang_ok.set(0)
+        t._one_hot("foreign")
+        tag = "ui_language_not_german"
+        event(logging.ERROR, "ui_language_not_german",
+              "heater UI language is not German — OCR anchors cannot match; no readings "
+              "are being published", foreign_frames=t.foreign)
+    elif t.confirmed_suspect:
+        t._one_hot("suspect")
+        tag = "ui_language_suspect"
+        event(logging.ERROR, "ui_language_suspect",
+              "screens carry readable text but no German anchors — UI language may have "
+              "changed (language not recognised, no reassert will be attempted)",
+              frames=t.suspect + t.foreign)
+    if tag:
+        _publish_ui_language(broker, dry_run,
+                             "non_german" if tag == "ui_language_not_german" else "suspect")
+    if tag == "ui_language_not_german":
+        try:
+            result = _reassert_ui_language(client)
+        except Exception as e:     # never let the guard break the nav-fail path
+            result = f"error:{e}"
+            event(logging.ERROR, "ui_language_reassert_error", "reassert raised", error=str(e))
+        if result == "halted":
+            _publish_ui_language(broker, dry_run, "reassert_halted")
+        elif result == "recovered":
+            _publish_ui_language(broker, dry_run, "german")
+    return tag
+
+
 def navigate_to(client, target: str, max_steps: int = 12) -> bool:
     """Drive VNC clicks until `_identify_screen()` returns `target`.
 
@@ -3297,6 +3698,10 @@ def navigate_to(client, target: str, max_steps: int = 12) -> bool:
             event(logging.DEBUG, "navigate_reached", "at target", target=target, steps=step)
             return True
         if current is None:
+            # An unrecognised frame is the one place a UI-language flip shows
+            # up: classify it so the nav-fail hook can tell "language changed"
+            # from "jammed modal / offline heater".
+            LANG_TRACKER.note(classify_ui_language(img))
             # Something changed (we can no longer name it), so the stuck-screen
             # streak is broken — don't let unknowns accumulate into it.
             same_screen, same_streak = None, 0
@@ -3325,6 +3730,11 @@ def navigate_to(client, target: str, max_steps: int = 12) -> bool:
             continue
         # Identified a known screen — reset the unknown streak.
         unknown_streak = 0
+        # Any screen recognised via its German header/label is German evidence.
+        # `main` is excluded (identified by a version string, language-neutral)
+        # and so is the modal (its text says nothing about the UI language).
+        if current not in ("main", "alert_modal"):
+            LANG_TRACKER.note(LANG_GERMAN)
         # Stuck-screen guard: same known screen again despite having clicked.
         if current == same_screen:
             same_streak += 1
@@ -3856,7 +4266,10 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
             except _NavFail as nf:
                 final_status = "navigation_failed"
                 final_error = f"could not reach {nf.screen}"
-                return _handle_nav_fail(client, broker, dry_run, nf.screen)
+                nav_result = _handle_nav_fail(client, broker, dry_run, nf.screen)
+                if nav_result.error:
+                    final_error += f" ({nav_result.error})"
+                return nav_result
             except _MaintenanceAbort:
                 event(logging.INFO, "maintenance_abort",
                       "cycle aborted mid-flight by Stop button, releasing VNC")
@@ -3994,6 +4407,7 @@ def run_cycle(broker: Optional[MqttBroker], dry_run: bool = False, first_run_ref
         m_runs.labels(status=result_status).inc()
         # A cycle that produced values is the definition of fresh data.
         _publish_availability(broker, dry_run, online=True)
+        ui_language_after_cycle_ok(broker, dry_run)
         final_status = result_status
         event(logging.INFO, "cycle_complete",
               f"cycle {result_status}", duration_s=round(duration, 2),
@@ -4063,11 +4477,13 @@ def _handle_nav_fail(client, broker: Optional[MqttBroker], dry_run: bool, screen
     except Exception:
         b64 = None
     m_runs.labels(status="navigation_failed").inc()
+    lang_tag = ui_language_after_nav_fail(client, broker, dry_run)
     _publish_availability(broker, dry_run, online=False)
     if broker and not dry_run and b64:
         broker.publish(f"{MQTT_DIAG_TOPIC_PREFIX}/scraper/last_error_image", b64, retain=True)
         broker.publish(f"{MQTT_TOPIC_PREFIX}/scraper/status", "navigation_failed", retain=True)
-    return CycleResult(status="navigation_failed", values={}, error_image_b64=b64)
+    return CycleResult(status="navigation_failed", values={}, error_image_b64=b64,
+                       error=lang_tag)
 
 # =============================================================================
 # CLI subcommands
