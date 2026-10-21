@@ -373,7 +373,12 @@ BBOXES: dict[str, FieldSpec] = {
     # hidden and Vorlauftemperatur shifts up to y≈320. Widened bbox captures
     # either without changing the OCR output — the digit glyphs sit centered
     # in the crop in both cases.
-    "og_vorlauftemperatur":     FieldSpec("heizkreise_og", (365, 316,  80, 26), FIELD_NUM,  "float"),
+    # Height 26 -> 30 (2026-10-21). The 26-px box sat on an edge: a frame
+    # showing a plain "33 °C" (tests/fixtures/miss_og_vorlauftemperatur_33.png,
+    # captured by the /screenshot/miss endpoint) OCR'd to nothing, ~4-14x a day
+    # since 10-13. Chosen by robustness, not proximity: 26 of 27 neighbouring
+    # boxes (+/-2 px x/y, +/-4 px h) read every OG fixture correctly, vs 23.
+    "og_vorlauftemperatur":     FieldSpec("heizkreise_og", (365, 316,  80, 30), FIELD_NUM,  "float"),
     # y was 355 h=22 until 2026-09-01: ~5px too low, clipping the digits so the
     # field read empty in HEIZBETRIEB and published nothing while HA kept showing
     # a stale retained 29.0 as if live. Vertical sweep on the committed
@@ -406,7 +411,13 @@ BBOXES: dict[str, FieldSpec] = {
     # bar), height 22 to cover the digits, width 72 to still exclude the "°C"
     # suffix (starts ~x245). Verified reading 75 (live) and 74 (reference) in
     # BOTH the lcd and plain pipelines — see tests/test_ocr_ww_ist_temp.py.
-    "ww_ist_temp":   FieldSpec("warmwasser", (168, 187,  72, 22), FIELD_NUM,  "float", lcd=True),
+    # (168,187,72,22) -> (160,187,72,26) (2026-10-21). The old box ended at
+    # x=240 and clipped the "°" of the unit (starts ~x=232) — the same
+    # unit-glyph intrusion fixed elsewhere — and read a displayed "54" as "4"
+    # (tests/fixtures/miss_ww_ist_temp_54.png); 53 bounds rejects across 10-07,
+    # 10-09 and 10-13, including a 6 h hold. Chosen by robustness: 17 of 27
+    # neighbouring boxes read every warmwasser fixture correctly, vs 8 of 27.
+    "ww_ist_temp":   FieldSpec("warmwasser", (160, 187,  72, 26), FIELD_NUM,  "float", lcd=True),
     "ww_soll_temp":  FieldSpec("warmwasser", (460, 215, 140, 28), FIELD_NUM,  "float"),
     "ww_modus":      FieldSpec("warmwasser", (290, 365, 150, 25), FIELD_TEXT, "str"),
     # Betriebsstundenzähler page 3 — Wärmeverteilung (heat distribution counters).
